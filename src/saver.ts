@@ -458,16 +458,48 @@ function withSaveLock<T>(callback: () => Promise<T>): Promise<T> {
 
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), SAVE_LOCK_TIMEOUT_MS);
-    return locks.request(SAVE_LOCK_NAME, { signal: controller.signal }, () => {
+    // Errors after the lock is granted come from the save itself, and mustn't cause a second attempt.
+    let granted = false;
+    const saveWithoutLock = (err: unknown) => {
         window.clearTimeout(timeout);
+        logDebug("Browser refused the save lock (%o), saving without it.", err);
         return callback();
-    }).catch((err: unknown) => {
+    };
+
+    let lockRequest: Promise<T>;
+    try {
+        lockRequest = locks.request(SAVE_LOCK_NAME, { signal: controller.signal }, () => {
+            granted = true;
+            window.clearTimeout(timeout);
+            return callback();
+        });
+    } catch (err) {
+        if (isSecurityError(err)) {
+            return saveWithoutLock(err);
+        }
+        window.clearTimeout(timeout);
+        throw err;
+    }
+
+    return lockRequest.catch((err: unknown) => {
+        if (granted) {
+            throw err;
+        }
         if (controller.signal.aborted) {
             throw "Timed out waiting for another tab to finish saving (it may be asking whether to overwrite " +
                 "the file). Nothing was saved";
         }
+        // E.g. the page has an opaque origin, such as in a sandboxed iframe.
+        if (isSecurityError(err)) {
+            return saveWithoutLock(err);
+        }
+        window.clearTimeout(timeout);
         throw err;
     });
+}
+
+function isSecurityError(err: unknown): boolean {
+    return !!err && (err as { name?: unknown }).name === "SecurityError";
 }
 
 function getCoreSaverHandler(): TWSaverHandlerInternals | undefined {
@@ -503,10 +535,30 @@ function sanitizeFileName(name: string): string {
     return (result === "" || result === "." || result === "..") ? DEFAULT_WIKI_FILENAME : result;
 }
 
-async function getWikiFileName(wiki: TWWiki): Promise<string> {
-    const explicitName = wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(WIKI_FILENAME_FIELD);
+// The name of the file this page was loaded from, if it was loaded from the file system.
+function getLoadedFileName(): string | undefined {
+    try {
+        if (window.location.protocol !== "file:") {
+            return undefined;
+        }
+        const name = decodeURIComponent(window.location.pathname.split("/").pop() || "").trim();
+        return name === "" ? undefined : name;
+    } catch (err) {
+        logDebug("Could not get the name of the file this page was loaded from: %o", err);
+        return undefined;
+    }
+}
 
-    if (!explicitName || explicitName.trim() === "") {
+function getWikiFileName(wiki: TWWiki): string {
+    const explicitName = wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(WIKI_FILENAME_FIELD);
+    // Prefer the file the user opened, so that renaming the wiki doesn't switch saving to another file.
+    const loadedFileName = getLoadedFileName();
+
+    if (explicitName && explicitName.trim() !== "") {
+        return sanitizeFileName(explicitName);
+    } else if (loadedFileName) {
+        return sanitizeFileName(loadedFileName);
+    } else {
         const wikiButtonFilename = wiki.getTiddler("$:/config/SaveWikiButton/Filename");
         const siteTitle = wiki.getTiddler("$:/SiteTitle");
 
@@ -517,8 +569,6 @@ async function getWikiFileName(wiki: TWWiki): Promise<string> {
         } else {
             return DEFAULT_WIKI_FILENAME;
         }
-    } else {
-        return sanitizeFileName(explicitName);
     }
 }
 
@@ -551,6 +601,8 @@ interface SaveRequest {
 
 interface SaveTarget {
     style: SaverStyle;
+    // The wiki file name inside the directory, for backup style.
+    fileName?: string;
     wikiFile: Promise<FileSystemFileHandle>;
     dirHandle?: Promise<FileSystemDirectoryHandle>;
 }
@@ -583,8 +635,10 @@ class FileSystemSaver implements TWSaver {
 
     // Must be called synchronously from save so that the browser allows showing file pickers.
     userInteractionInit(saverStyle: SaverStyle): SaveTarget {
-        if (this.target && this.target.style === saverStyle) {
-            return this.target;
+        const fileName = saverStyle === SaverStyle.SingleFile ? undefined : getWikiFileName(this.wiki);
+        const current = this.target;
+        if (current && current.style === saverStyle && current.fileName === fileName) {
+            return current;
         }
 
         let target: SaveTarget;
@@ -596,19 +650,16 @@ class FileSystemSaver implements TWSaver {
                 wikiFile: getFileHandle(this.wiki)
             };
         } else {
-            logDebug("Attempting to get directory handle.");
-
-            const dirHandle = getDirectoryHandle(this.wiki);
+            // If only the file name setting changed, reuse the directory, which also needs no picker.
+            const dirHandle = current && current.style === saverStyle ? current.dirHandle! : getDirectoryHandle(this.wiki);
+            logDebug("Using directory handle for wiki file: %o", fileName);
             target = {
                 style: saverStyle,
+                fileName,
                 dirHandle,
-                wikiFile: dirHandle.then(async actualDirHandle => {
-                    const wikiFileName = await getWikiFileName(this.wiki);
-                    logDebug("Filename of wiki is: %o", wikiFileName);
-                    return actualDirHandle.getFileHandle(wikiFileName, {
-                        create: true
-                    });
-                })
+                wikiFile: dirHandle.then(actualDirHandle => actualDirHandle.getFileHandle(fileName!, {
+                    create: true
+                }))
             };
         }
 

@@ -22,7 +22,7 @@ caption: HTML Native File System Saver
 </$select>
 
 <$reveal type="match" stateTitle=<<nativeSaverSettings>> stateField="save-style" text="single-file-version-backup">
-    Wiki file name (same as download saver if empty): <$edit-text tiddler=<<nativeSaverSettings>> field="wiki-file-name" />
+    Wiki file name (if empty, the name of the file this wiki was opened from, or the download saver's name when not opened from a file): <$edit-text tiddler=<<nativeSaverSettings>> field="wiki-file-name" />
 </$reveal>
 
 <$button>
