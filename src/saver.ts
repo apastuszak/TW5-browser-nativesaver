@@ -675,8 +675,9 @@ class FileSystemSaver implements TWSaver {
     private defaultWikiFileName: string;
     // The hash of the last text this page wrote to each wiki file. A file still holding it hasn't been
     // changed by anyone else since. Older versions don't count, since the user may have restored one.
-    // Files are compared with isSameEntry, since the same name can be in different directories.
-    private lastWritten: { handle: FileSystemFileHandle; hash: string }[] = [];
+    // Files are compared with isSameEntry, since the same name can be in different directories. backedUp is
+    // whether that save also wrote a backup of the text (only backup style does).
+    private lastWritten: { handle: FileSystemFileHandle; hash: string; backedUp: boolean }[] = [];
     // Counts overwrite questions, so a save knows to read the file again after one (see saveFile).
     private questionsAsked = 0;
 
@@ -779,12 +780,13 @@ class FileSystemSaver implements TWSaver {
         return entry && entry.hash;
     }
 
-    async setLastWrittenHash(handle: FileSystemFileHandle, hash: string) {
+    async setLastWrittenHash(handle: FileSystemFileHandle, hash: string, backedUp: boolean) {
         const entry = await this.findLastWritten(handle);
         if (entry) {
             entry.hash = hash;
+            entry.backedUp = backedUp;
         } else {
-            this.lastWritten.push({ handle, hash });
+            this.lastWritten.push({ handle, hash, backedUp });
         }
     }
 
@@ -865,7 +867,7 @@ class FileSystemSaver implements TWSaver {
         });
 
         // Only remember the new hash once the file actually contains this text.
-        await this.setLastWrittenHash(handle, await textHashProm);
+        await this.setLastWrittenHash(handle, await textHashProm, target.style === SaverStyle.SingleFileVersionBackup);
     }
 
     async saveBackup(target: SaveTarget, text: string, textHash: string, readCurrent: () => Promise<FileContents>) {
@@ -880,10 +882,11 @@ class FileSystemSaver implements TWSaver {
 
         // Also keep what is in the file now, which may not be from this page (e.g. the user agreed to
         // overwrite another tab's changes or to replace another file). Not needed if it still holds what
-        // this page last wrote to it, since that save also wrote its backup.
+        // this page last wrote to it and that save also wrote its backup (a single-file save didn't).
         const current = await readCurrent();
-        const unchangedSinceOurSave = await this.getLastWrittenHash(wikiFileHandle) === current.hash;
-        if (current.size > 0 && !unchangedSinceOurSave) {
+        const lastWritten = await this.findLastWritten(wikiFileHandle);
+        const alreadyBackedUp = !!lastWritten && lastWritten.hash === current.hash && lastWritten.backedUp;
+        if (current.size > 0 && !alreadyBackedUp) {
             await writeBackup(wikiBackupDir, current.text, current.hash, true);
         }
         await writeBackup(wikiBackupDir, text, textHash, false);
