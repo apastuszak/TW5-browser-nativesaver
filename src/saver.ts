@@ -200,6 +200,7 @@ const HANDLE_KEY_PREFIX = "WIKI_FILE_HANDLE:";
 // Keys from before 0.8.0, which hashed the URL differently and so can't be looked up any more.
 const LEGACY_HANDLE_KEY_PREFIX = "CURRENT_FILE_HANDLE";
 const SAVE_LOCK_NAME = `${PLUGIN_NAME}/save`;
+const SAVE_LOCK_TIMEOUT_MS = 30000;
 const IDB_READWRITE = "readwrite";
 const IDB_READONLY = "readonly";
 const IDB_RELAXED = "relaxed";
@@ -446,14 +447,27 @@ const removeCachedHandleInBackground = () => {
 };
 
 // Other tabs have their own FileSystemSaver, so they need a lock shared between tabs to avoid both
-// passing the consistency check before either one writes.
+// passing the consistency check before either one writes. Gives up rather than waiting forever, e.g.
+// while another tab asks whether to overwrite.
 function withSaveLock<T>(callback: () => Promise<T>): Promise<T> {
     const locks = (navigator as any).locks;
     if (!locks) {
         logDebug("Web Locks API not available, saving without a lock.");
         return callback();
     }
-    return locks.request(SAVE_LOCK_NAME, callback);
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), SAVE_LOCK_TIMEOUT_MS);
+    return locks.request(SAVE_LOCK_NAME, { signal: controller.signal }, () => {
+        window.clearTimeout(timeout);
+        return callback();
+    }).catch((err: unknown) => {
+        if (controller.signal.aborted) {
+            throw "Timed out waiting for another tab to finish saving (it may be asking whether to overwrite " +
+                "the file). Nothing was saved";
+        }
+        throw err;
+    });
 }
 
 function getCoreSaverHandler(): TWSaverHandlerInternals | undefined {
@@ -526,6 +540,14 @@ async function writeFile(handle: FileSystemFileHandle, text: string) {
 
 // The handles for one save location, captured when a save starts so that a reset or style change
 // doesn't affect saves which are already queued.
+interface SaveRequest {
+    doSave(): Promise<void>;
+    callback: TWSaverCB;
+    changesIncluded: Promise<number | undefined>;
+    // True if this or a save it replaced was a manual save.
+    manual: boolean;
+}
+
 interface SaveTarget {
     style: SaverStyle;
     wikiFile: Promise<FileSystemFileHandle>;
@@ -544,6 +566,9 @@ class FileSystemSaver implements TWSaver {
     private prevWikiFile?: Promise<FileSystemFileHandle>;
     // TiddlyWiki doesn't wait for one save to finish before starting the next, so saves are chained.
     private saveQueue: Promise<void> = Promise.resolve();
+    // The save waiting for the current one to finish. A newer save replaces it, since the newer text
+    // includes its changes and each request holds a full copy of the wiki.
+    private pendingSave?: SaveRequest;
     // How many changes our save callbacks have marked as saved. Added to TiddlyWiki's count of unsaved
     // changes, this gives a total which never goes down.
     private changesMarkedSaved = 0;
@@ -735,31 +760,46 @@ class FileSystemSaver implements TWSaver {
                 return false;
         }
 
-        const changesIncluded = this.snapshotIncludedChanges();
-        const savePromise = this.saveQueue.then(() => {
-            // Checked here too since the user may decline an overwrite while this save is queued.
-            if (method === SaverCapability.AutoSave && this.autosaveSuspended) {
-                return false;
-            }
-            return doSave().then(() => true);
-        });
-        // Keep the queue going even if this save fails.
-        this.saveQueue = savePromise.then(() => {}, () => {});
-
-        savePromise.then(async saved => {
-            if (!saved) {
-                // Like a skipped autosave, don't call back so the wiki stays dirty.
-                logDebug("Skipped autosave since the user declined to overwrite a changed file");
-                return;
-            }
-            logDebug("Successfully saved to file system");
-            this.markSaved(await changesIncluded, callback);
-        }, err => {
-            logDebug("Encountered error while saving: %o", err);
-            callback(`Encountered error while saving to file system: [${err}]`);
-        });
+        const replaced = this.pendingSave;
+        this.pendingSave = {
+            doSave,
+            callback,
+            changesIncluded: this.snapshotIncludedChanges(),
+            manual: method === SaverCapability.Save || (!!replaced && replaced.manual)
+        };
+        if (replaced) {
+            // Its callback is never called, the newer save reports for both.
+            logDebug("Replaced a save which was still waiting with this newer one");
+        } else {
+            // Catch so that an unexpected error can't stop all later saves.
+            this.saveQueue = this.saveQueue.then(() => this.runPendingSave()).catch(err => {
+                console.error("Unexpected error while saving: %o", err);
+            });
+        }
 
         return true;
+    }
+
+    async runPendingSave() {
+        const request = this.pendingSave!;
+        this.pendingSave = undefined;
+
+        // Checked here too since the user may decline an overwrite while this save is waiting.
+        if (!request.manual && this.autosaveSuspended) {
+            // Like a skipped autosave, don't call back so the wiki stays dirty.
+            logDebug("Skipped autosave since the user declined to overwrite a changed file");
+            return;
+        }
+
+        try {
+            await request.doSave();
+        } catch (err) {
+            logDebug("Encountered error while saving: %o", err);
+            request.callback(`Encountered error while saving to file system: [${err}]`);
+            return;
+        }
+        logDebug("Successfully saved to file system");
+        this.markSaved(await request.changesIncluded, request.callback);
     }
 
     // Works out how many changes the text being saved includes, as a total comparable with getTotalChanges.

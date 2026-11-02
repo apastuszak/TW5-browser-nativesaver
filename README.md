@@ -29,6 +29,11 @@ the browser has already granted: open pages keep it until they are closed,
 and if you chose "Allow on every visit" you need to remove it in the
 browser's site settings.
 
+Version 0.8.0 stores saved locations under new keys and deletes the old ones,
+since they can no longer be looked up. On file:// all wikis share this storage,
+so another local wiki still on an older version of this plugin will ask for its
+file again after a wiki with 0.8.0 has been opened. Upgrade both to avoid this.
+
 It is recommended to backup the location where you store your wiki regularly.
 However, the single file with versioned backup saver style saves each version
 of your wiki under /{selected folder}/backups/{wiki filename}/{version hash}.html.
