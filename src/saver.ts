@@ -313,13 +313,7 @@ interface IndexedDBCacheable<T> {
     oldIsValid(old: any): old is T;
 }
 
-interface CachedHandle<T> {
-    handle: T;
-    // True if the user just picked this handle rather than it coming from IndexedDB.
-    isNew: boolean;
-}
-
-async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheable: IndexedDBCacheable<T>): Promise<CachedHandle<T>> {
+async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheable: IndexedDBCacheable<T>): Promise<T> {
     let db: IDBDatabase;
 
     await pendingHandleRemoval;
@@ -330,7 +324,7 @@ async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheab
         db = await tryCreateHandleStore(wiki);
     } catch (err) {
         logDebug("Could not get handle store due to error, must request file location from user: %o", err);
-        return { handle: await cacheable.requestNew(), isNew: true };
+        return await cacheable.requestNew();
     }
 
     const requestAndStoreNewFile = async () => {
@@ -354,7 +348,7 @@ async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheab
             logDebug("Failed to initate save request for file hande due to error: %o", err);
         }
 
-        return { handle, isNew: true };
+        return handle;
     };
 
     try {
@@ -376,7 +370,7 @@ async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheab
         }
         logDebug("Successfully obtained RW permission on file system object.");
 
-        return { handle: maybeFileHandle, isNew: false };
+        return maybeFileHandle;
     } catch (err) {
         logDebug("Could not get previous handle, must request a new one due to error: %o", err);
         return await requestAndStoreNewFile();
@@ -524,28 +518,11 @@ async function writeFile(handle: FileSystemFileHandle, text: string) {
     await writable.close();
 }
 
-// Lets the user explicitly overwrite a file which was changed elsewhere, rejecting if they decline.
-function confirmOverwrite(problem: string): Promise<void> {
-    const message = `${problem}, maybe by another tab or program.\n\n` +
-        "Overwrite it anyway? Any changes made there will be lost. Cancel and reload the page to keep them.";
-    if (window.confirm(message)) {
-        logDebug("User chose to overwrite the changed file");
-        return Promise.resolve();
-    }
-    return Promise.reject(`${problem}. Reload the page to get the latest version before saving`);
-}
-
-interface WikiFile {
-    handle: FileSystemFileHandle;
-    // True if the user picked this exact file this session, confirming it may be overwritten.
-    pickedByUser: boolean;
-}
-
 // The handles for one save location, captured when a save starts so that a reset or style change
 // doesn't affect saves which are already queued.
 interface SaveTarget {
     style: SaverStyle;
-    wikiFile: Promise<WikiFile>;
+    wikiFile: Promise<FileSystemFileHandle>;
     dirHandle?: Promise<FileSystemDirectoryHandle>;
 }
 
@@ -558,12 +535,14 @@ class FileSystemSaver implements TWSaver {
     private target?: SaveTarget;
     // Hash of the last text this page successfully wrote, and the file it was written to.
     private prevPageHash?: string;
-    private prevWikiFile?: Promise<WikiFile>;
+    private prevWikiFile?: Promise<FileSystemFileHandle>;
     // TiddlyWiki doesn't wait for one save to finish before starting the next, so saves are chained.
     private saveQueue: Promise<void> = Promise.resolve();
     // How many changes our save callbacks have marked as saved. Added to TiddlyWiki's count of unsaved
     // changes, this gives a total which never goes down.
     private changesMarkedSaved = 0;
+    // Set when the user declines to overwrite a changed file, until their next manual save.
+    private autosaveSuspended = false;
 
     constructor(private wiki: TWWiki) {
         setupLogging(wiki);
@@ -582,25 +561,21 @@ class FileSystemSaver implements TWSaver {
 
             target = {
                 style: saverStyle,
-                wikiFile: getFileHandle(this.wiki).then(cached => ({
-                    handle: cached.handle,
-                    pickedByUser: cached.isNew
-                }))
+                wikiFile: getFileHandle(this.wiki)
             };
         } else {
             logDebug("Attempting to get directory handle.");
 
-            const dirHandle = getDirectoryHandle(this.wiki).then(cached => cached.handle);
+            const dirHandle = getDirectoryHandle(this.wiki);
             target = {
                 style: saverStyle,
                 dirHandle,
                 wikiFile: dirHandle.then(async actualDirHandle => {
                     const wikiFileName = await getWikiFileName(this.wiki);
                     logDebug("Filename of wiki is: %o", wikiFileName);
-                    const handle = await actualDirHandle.getFileHandle(wikiFileName, {
+                    return actualDirHandle.getFileHandle(wikiFileName, {
                         create: true
                     });
-                    return { handle, pickedByUser: false };
                 })
             };
         }
@@ -617,8 +592,8 @@ class FileSystemSaver implements TWSaver {
         return target;
     }
 
-    async checkConsistency(wikiFile: Promise<WikiFile>) {
-        const { handle, pickedByUser } = await wikiFile;
+    async checkConsistency(wikiFile: Promise<FileSystemFileHandle>) {
+        const handle = await wikiFile;
         logDebug("Reading current value to check consistency");
         const file = await handle.getFile();
 
@@ -631,27 +606,42 @@ class FileSystemSaver implements TWSaver {
 
             if (this.prevWikiFile === wikiFile) {
                 logDebug("Expected hash to be [%s] but it is currently [%s]", this.prevPageHash, currentHash);
-                return confirmOverwrite("The wiki file no longer contains what this page last saved");
+                return this.confirmOverwrite("The wiki file no longer contains what this page last saved");
             }
         }
 
-        // This is the first save to this file, so check the file wasn't saved after this page loaded.
-        if (pickedByUser) {
-            logDebug("User picked this file, so overwriting it is expected");
-        } else if (file.size === 0) {
+        // This is the first save to this file, so check the file wasn't saved after this page loaded. This
+        // applies even to a file the user just picked, since they will usually re-pick the wiki's own file,
+        // which another tab may have saved since.
+        if (file.size === 0) {
             logDebug("File is empty, so saving is safe");
         } else if (file.lastModified > performance.timeOrigin) {
             logDebug("File was modified at %o which is after page load at %o", file.lastModified, performance.timeOrigin);
-            return confirmOverwrite("The wiki file was modified after this page was loaded");
+            return this.confirmOverwrite("The wiki file was modified after this page was loaded");
         }
+    }
+
+    // Lets the user explicitly overwrite a file which was changed elsewhere, rejecting if they decline.
+    confirmOverwrite(problem: string): Promise<void> {
+        const message = `${problem}, maybe by another tab or program.\n\n` +
+            "Overwrite it anyway? Any changes made there will be lost.\n\n" +
+            "If you cancel, nothing is saved and autosave pauses until you save manually. Reloading the page " +
+            "would load the other changes but discard this page's unsaved changes.";
+        if (window.confirm(message)) {
+            logDebug("User chose to overwrite the changed file");
+            return Promise.resolve();
+        }
+        // Otherwise every autosave would ask again.
+        this.autosaveSuspended = true;
+        return Promise.reject(`${problem}. Nothing was saved`);
     }
 
     shouldCheckConsistency() {
         return this.wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(CHECK_CONSISTENCY_FIELD) === YES;
     }
 
-    async saveFile(wikiFile: Promise<WikiFile>, text: string) {
-        const { handle } = await wikiFile;
+    async saveFile(wikiFile: Promise<FileSystemFileHandle>, text: string) {
+        const handle = await wikiFile;
         const textHashProm = hashToString(text);
 
         await withSaveLock(async () => {
@@ -677,7 +667,7 @@ class FileSystemSaver implements TWSaver {
         const backupDir = await dirHandle.getDirectoryHandle(BACKUP_FOLDER_NAME, {
             create: true
         });
-        const wikiFileName = (await target.wikiFile).handle.name;
+        const wikiFileName = (await target.wikiFile).name;
         const wikiBackupDir = await backupDir.getDirectoryHandle(wikiFileName, {
             create: true
         });
@@ -707,14 +697,18 @@ class FileSystemSaver implements TWSaver {
         }
 
         const saverStyle = getSaverStyle(this.wiki);
-        if (method === SaverCapability.AutoSave && (!this.target || this.target.style !== saverStyle)) {
-            // Browsers only allow file pickers and permission prompts in response to a click. Claim the
-            // save without calling back so the wiki stays dirty and other savers don't take over.
-            logDebug("Skipping autosave until the save location is set up by a manual save.");
+        if (method === SaverCapability.AutoSave && (!this.target || this.target.style !== saverStyle || this.autosaveSuspended)) {
+            // Browsers only allow file pickers and permission prompts in response to a click, and after a
+            // declined overwrite we wait for the user. Claim the save without calling back so the wiki stays
+            // dirty and other savers don't take over.
+            logDebug("Skipping autosave until the user saves manually.");
             return true;
         }
 
         logDebug("Saving with method %o", method);
+        if (method === SaverCapability.Save) {
+            this.autosaveSuspended = false;
+        }
         const target = this.userInteractionInit(saverStyle);
 
         let doSave: () => Promise<void>;
@@ -730,14 +724,29 @@ class FileSystemSaver implements TWSaver {
                 return false;
         }
 
-        const changesIncluded = this.getTotalChanges();
-        const savePromise = this.saveQueue.then(doSave);
+        // TiddlyWiki counts changes in a setTimeout, so wait for changes made just before this save (e.g. by
+        // the same button) to be counted.
+        const changesIncluded = new Promise<number | undefined>(resolve => {
+            window.setTimeout(() => resolve(this.getTotalChanges()), 0);
+        });
+        const savePromise = this.saveQueue.then(() => {
+            // Checked here too since the user may decline an overwrite while this save is queued.
+            if (method === SaverCapability.AutoSave && this.autosaveSuspended) {
+                return false;
+            }
+            return doSave().then(() => true);
+        });
         // Keep the queue going even if this save fails.
-        this.saveQueue = savePromise.catch(() => {});
+        this.saveQueue = savePromise.then(() => {}, () => {});
 
-        savePromise.then(() => {
+        savePromise.then(async saved => {
+            if (!saved) {
+                // Like a skipped autosave, don't call back so the wiki stays dirty.
+                logDebug("Skipped autosave since the user declined to overwrite a changed file");
+                return;
+            }
             logDebug("Successfully saved to file system");
-            this.markSaved(changesIncluded, callback);
+            this.markSaved(await changesIncluded, callback);
         }, err => {
             logDebug("Encountered error while saving: %o", err);
             callback(`Encountered error while saving to file system: [${err}]`);
@@ -777,6 +786,7 @@ class FileSystemSaver implements TWSaver {
         removeCachedHandleInBackground();
         setupLogging(this.wiki);
         this.target = undefined;
+        this.autosaveSuspended = false;
         logDebug("Reset file save location.");
     }
 }
