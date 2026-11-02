@@ -541,6 +541,7 @@ async function writeFile(handle: FileSystemFileHandle, text: string) {
 // The handles for one save location, captured when a save starts so that a reset or style change
 // doesn't affect saves which are already queued.
 interface SaveRequest {
+    target: SaveTarget;
     doSave(): Promise<void>;
     callback: TWSaverCB;
     changesIncluded: Promise<number | undefined>;
@@ -566,8 +567,8 @@ class FileSystemSaver implements TWSaver {
     private prevWikiFile?: Promise<FileSystemFileHandle>;
     // TiddlyWiki doesn't wait for one save to finish before starting the next, so saves are chained.
     private saveQueue: Promise<void> = Promise.resolve();
-    // The save waiting for the current one to finish. A newer save replaces it, since the newer text
-    // includes its changes and each request holds a full copy of the wiki.
+    // The newest save waiting for earlier ones to finish. A newer save to the same target replaces its
+    // contents, since the newer text includes its changes and each request holds a full copy of the wiki.
     private pendingSave?: SaveRequest;
     // How many changes our save callbacks have marked as saved. Added to TiddlyWiki's count of unsaved
     // changes, this gives a total which never goes down.
@@ -760,19 +761,22 @@ class FileSystemSaver implements TWSaver {
                 return false;
         }
 
-        const replaced = this.pendingSave;
-        this.pendingSave = {
-            doSave,
-            callback,
-            changesIncluded: this.snapshotIncludedChanges(),
-            manual: method === SaverCapability.Save || (!!replaced && replaced.manual)
-        };
-        if (replaced) {
-            // Its callback is never called, the newer save reports for both.
+        const isManual = method === SaverCapability.Save;
+        const changesIncluded = this.snapshotIncludedChanges();
+        const pending = this.pendingSave;
+        if (pending && pending.target === target) {
+            // The old callback is never called, the newer save reports for both. Saves to a different target
+            // (after a reset or style change) aren't replaced, since that file wouldn't get its save.
             logDebug("Replaced a save which was still waiting with this newer one");
+            pending.doSave = doSave;
+            pending.callback = callback;
+            pending.changesIncluded = changesIncluded;
+            pending.manual = pending.manual || isManual;
         } else {
+            const request: SaveRequest = { target, doSave, callback, changesIncluded, manual: isManual };
+            this.pendingSave = request;
             // Catch so that an unexpected error can't stop all later saves.
-            this.saveQueue = this.saveQueue.then(() => this.runPendingSave()).catch(err => {
+            this.saveQueue = this.saveQueue.then(() => this.runSave(request)).catch(err => {
                 console.error("Unexpected error while saving: %o", err);
             });
         }
@@ -780,12 +784,16 @@ class FileSystemSaver implements TWSaver {
         return true;
     }
 
-    async runPendingSave() {
-        const request = this.pendingSave!;
-        this.pendingSave = undefined;
+    async runSave(request: SaveRequest) {
+        if (this.pendingSave === request) {
+            this.pendingSave = undefined;
+        }
 
-        // Checked here too since the user may decline an overwrite while this save is waiting.
-        if (!request.manual && this.autosaveSuspended) {
+        if (request.manual) {
+            // The user may have declined an overwrite after clicking save, while this was waiting.
+            this.autosaveSuspended = false;
+        } else if (this.autosaveSuspended) {
+            // Checked here too since the user may decline an overwrite while this save is waiting.
             // Like a skipped autosave, don't call back so the wiki stays dirty.
             logDebug("Skipped autosave since the user declined to overwrite a changed file");
             return;
