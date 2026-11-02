@@ -676,8 +676,11 @@ class FileSystemSaver implements TWSaver {
     private autosaveSuspended = false;
     // See getDefaultWikiFileName.
     private defaultWikiFileName: string;
-    // Hashes of every text this page has written to a wiki file, so a file holding one of them is ours.
-    private writtenHashes = new Set<string>();
+    // The hash of the last text this page wrote to each wiki file name. A file still holding it hasn't been
+    // changed by anyone else since. Older versions don't count, since the user may have restored one.
+    private lastWrittenHashes = new Map<string, string>();
+    // Counts overwrite questions, so a save knows to read the file again after one (see saveFile).
+    private questionsAsked = 0;
 
     constructor(private wiki: TWWiki) {
         setupLogging(wiki);
@@ -742,10 +745,9 @@ class FileSystemSaver implements TWSaver {
         logDebug("Reading current value to check consistency");
         const file = await readCurrent();
 
-        // A version this page wrote means nobody else changed the file since, even if it is an earlier one
-        // (e.g. a file saved before renaming), and this page's text includes it.
-        if (this.writtenHashes.has(file.hash)) {
-            logDebug("File holds a version this page wrote, so saving is safe");
+        // Also covers a file this page saved before a rename (and its text includes that version).
+        if (this.lastWrittenHashes.get((await wikiFile).name) === file.hash) {
+            logDebug("File holds what this page last wrote to it, so saving is safe");
             return;
         }
 
@@ -778,7 +780,7 @@ class FileSystemSaver implements TWSaver {
     // so a failed save asks again.
     async confirmReplace(handle: FileSystemFileHandle, readCurrent: () => Promise<FileContents>): Promise<boolean> {
         const file = await readCurrent();
-        const isOurs = file.size === 0 || this.writtenHashes.has(file.hash);
+        const isOurs = file.size === 0 || this.lastWrittenHashes.get(handle.name) === file.hash;
         if (!isOurs) {
             const problem = `"${handle.name}" already exists and wasn't saved by this page`;
             await this.askToOverwrite(`${problem}. It may be a different wiki.\n\n` +
@@ -790,6 +792,7 @@ class FileSystemSaver implements TWSaver {
     }
 
     askToOverwrite(message: string, problem: string): Promise<void> {
+        this.questionsAsked++;
         if (window.confirm(message)) {
             logDebug("User chose to overwrite the file");
             return Promise.resolve();
@@ -814,6 +817,7 @@ class FileSystemSaver implements TWSaver {
         await withSaveLock(async () => {
             let current: Promise<FileContents> | undefined;
             const readCurrent = () => current || (current = readContents(handle));
+            const questionsBefore = this.questionsAsked;
 
             // Done regardless of the consistency setting, since this is about replacing a different file.
             const userAgreedToReplace = target.confirmReplace ? await this.confirmReplace(handle, readCurrent) : false;
@@ -825,6 +829,10 @@ class FileSystemSaver implements TWSaver {
                 logDebug("Skipping consistency check");
             }
 
+            if (this.questionsAsked !== questionsBefore) {
+                // The file may have changed while the question was open, so back up what is there now.
+                current = undefined;
+            }
             if (beforeWrite) {
                 await beforeWrite(readCurrent, await textHashProm);
             }
@@ -838,7 +846,7 @@ class FileSystemSaver implements TWSaver {
         // Only remember the new hash once the file actually contains this text.
         this.prevPageHash = await textHashProm;
         this.prevWikiFile = wikiFile;
-        this.writtenHashes.add(this.prevPageHash);
+        this.lastWrittenHashes.set(handle.name, this.prevPageHash);
     }
 
     async saveBackup(target: SaveTarget, text: string, textHash: string, readCurrent: () => Promise<FileContents>) {
