@@ -402,14 +402,11 @@ async function hashToString(data: string | ArrayBuffer): Promise<string> {
     return hashArray.map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
-// Replaces characters that are invalid in file names on at least one major OS.
+// Only replaces what the File System Access API rejects. Changing anything else would make existing
+// wikis start saving to a different file.
 function sanitizeFileName(name: string): string {
-    const result = name
-        .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
-        .trim()
-        // Windows does not allow trailing dots or spaces, this also gets rid of "." and "..".
-        .replace(/[. ]+$/, "");
-    return result === "" ? DEFAULT_WIKI_FILENAME : result;
+    const result = name.replace(/[/\\]/g, "_").trim();
+    return (result === "" || result === "." || result === "..") ? DEFAULT_WIKI_FILENAME : result;
 }
 
 async function getWikiFileName(wiki: TWWiki): Promise<string> {
@@ -437,7 +434,11 @@ async function writeFile(handle: FileSystemFileHandle, text: string) {
         await writable.write(text);
     } catch (err) {
         // Closing would commit a partially written file, so throw away the changes instead.
-        await writable.abort();
+        try {
+            await writable.abort();
+        } catch (abortErr) {
+            logDebug("Could not abort writing file: %o", abortErr);
+        }
         throw err;
     }
     await writable.close();
