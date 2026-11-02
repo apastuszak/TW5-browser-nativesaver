@@ -653,15 +653,23 @@ class FileSystemSaver implements TWSaver {
     // The newest save waiting for earlier ones to finish. A newer save to the same target replaces its
     // contents, since the newer text includes its changes and each request holds a full copy of the wiki.
     private pendingSave?: SaveRequest;
-    // How many changes our save callbacks have marked as saved. Added to TiddlyWiki's count of unsaved
-    // changes, this gives a total which never goes down.
-    private changesMarkedSaved = 0;
+    // Every change counted the way TiddlyWiki counts unsaved changes, but never reset. TiddlyWiki's own
+    // count can't be used for this, since other savers (e.g. while this one is disabled) reset it.
+    private totalChanges = 0;
     // Set when the user declines to overwrite a changed file, until their next manual save.
     private autosaveSuspended = false;
 
     constructor(private wiki: TWWiki) {
         setupLogging(wiki);
         logDebug("Constructing a FileSystemSaver");
+        wiki.addEventListener("change", changes => {
+            const handler = getCoreSaverHandler();
+            if (handler) {
+                this.totalChanges += handler.filterFn(iterator => {
+                    Object.keys(changes).forEach(title => iterator(wiki.getTiddler(title), title));
+                }).length;
+            }
+        });
     }
 
     // Must be called synchronously from save so that the browser allows showing file pickers.
@@ -946,8 +954,7 @@ class FileSystemSaver implements TWSaver {
     }
 
     getTotalChanges(): number | undefined {
-        const handler = getCoreSaverHandler();
-        return handler ? handler.numChanges + this.changesMarkedSaved : undefined;
+        return getCoreSaverHandler() ? this.totalChanges : undefined;
     }
 
     // TiddlyWiki's callback marks every change as saved, including ones made after this save's text was
@@ -960,15 +967,15 @@ class FileSystemSaver implements TWSaver {
             return;
         }
 
-        const unsavedChanges = Math.max(0, totalChanges - changesIncluded);
-        const changesBefore = handler.numChanges;
+        // Both counts are changes made since some point: this save's text, and the last save by any saver
+        // (which may be a later save by another saver). Only changes after both are still unsaved.
+        const unsavedChanges = Math.min(Math.max(0, totalChanges - changesIncluded), handler.numChanges);
         callback(null);
         if (unsavedChanges > 0 && handler.numChanges < unsavedChanges) {
             logDebug("%o changes were made after this save started, keeping them unsaved", unsavedChanges);
             handler.numChanges = unsavedChanges;
             handler.updateDirtyStatus();
         }
-        this.changesMarkedSaved += changesBefore - handler.numChanges;
     }
 
     reset() {
