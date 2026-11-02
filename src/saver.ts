@@ -529,9 +529,9 @@ async function hashToString(data: string | ArrayBuffer): Promise<string> {
 }
 
 // Only replaces what the File System Access API rejects. Changing anything else would make existing
-// wikis start saving to a different file.
+// wikis start saving to a different file. Callers trim names the user typed, but not the opened file's.
 function sanitizeFileName(name: string): string {
-    const result = name.replace(/[/\\]/g, "_").trim();
+    const result = name.replace(/[/\\]/g, "_");
     return (result === "" || result === "." || result === "..") ? DEFAULT_WIKI_FILENAME : result;
 }
 
@@ -541,8 +541,9 @@ function getLoadedFileName(): string | undefined {
         if (window.location.protocol !== "file:") {
             return undefined;
         }
-        const name = decodeURIComponent(window.location.pathname.split("/").pop() || "").trim();
-        return name === "" ? undefined : name;
+        // Not trimmed, since spaces are part of the real file name.
+        const name = decodeURIComponent(window.location.pathname.split("/").pop() || "");
+        return name.trim() === "" ? undefined : name;
     } catch (err) {
         logDebug("Could not get the name of the file this page was loaded from: %o", err);
         return undefined;
@@ -555,7 +556,7 @@ function getWikiFileName(wiki: TWWiki): string {
     const loadedFileName = getLoadedFileName();
 
     if (explicitName && explicitName.trim() !== "") {
-        return sanitizeFileName(explicitName);
+        return sanitizeFileName(explicitName.trim());
     } else if (loadedFileName) {
         return sanitizeFileName(loadedFileName);
     } else {
@@ -563,13 +564,34 @@ function getWikiFileName(wiki: TWWiki): string {
         const siteTitle = wiki.getTiddler("$:/SiteTitle");
 
         if (wikiButtonFilename) {
-            return sanitizeFileName(wikiButtonFilename.getFieldString("text"));
+            return sanitizeFileName(wikiButtonFilename.getFieldString("text").trim());
         } else if (siteTitle) {
             return sanitizeFileName(`${siteTitle.getFieldString("text").trim()}.html`);
         } else {
             return DEFAULT_WIKI_FILENAME;
         }
     }
+}
+
+// Backups are named by the hash of their text, so the same version is only stored once.
+async function writeBackup(backupDir: FileSystemDirectoryHandle, text: string, skipIfExists: boolean) {
+    const backupFileName = `${await hashToString(text)}.html`;
+    if (skipIfExists) {
+        try {
+            await backupDir.getFileHandle(backupFileName);
+            logDebug("Backup %o already exists", backupFileName);
+            return;
+        } catch (err) {
+            if (!err || (err as { name?: unknown }).name !== "NotFoundError") {
+                throw err;
+            }
+        }
+    }
+    logDebug("Backing up wiki file to %o", backupFileName);
+    const backupFile = await backupDir.getFileHandle(backupFileName, {
+        create: true
+    });
+    await writeFile(backupFile, text);
 }
 
 async function writeFile(handle: FileSystemFileHandle, text: string) {
@@ -603,6 +625,10 @@ interface SaveTarget {
     style: SaverStyle;
     // The wiki file name inside the directory, for backup style.
     fileName?: string;
+    // Set when the file name changed this session, until the first save to it. The new name may be
+    // another existing wiki, which the consistency check would let us overwrite since it was saved before
+    // this page loaded.
+    confirmReplace?: boolean;
     wikiFile: Promise<FileSystemFileHandle>;
     dirHandle?: Promise<FileSystemDirectoryHandle>;
 }
@@ -656,6 +682,7 @@ class FileSystemSaver implements TWSaver {
             target = {
                 style: saverStyle,
                 fileName,
+                confirmReplace: !!current && current.style === saverStyle,
                 dirHandle,
                 wikiFile: dirHandle.then(actualDirHandle => actualDirHandle.getFileHandle(fileName!, {
                     create: true
@@ -706,12 +733,32 @@ class FileSystemSaver implements TWSaver {
 
     // Lets the user explicitly overwrite a file which was changed elsewhere, rejecting if they decline.
     confirmOverwrite(problem: string): Promise<void> {
-        const message = `${problem}, maybe by another tab or program.\n\n` +
+        return this.askToOverwrite(`${problem}, maybe by another tab or program.\n\n` +
             "Overwrite it anyway? Any changes made there will be lost.\n\n" +
             "If you cancel, nothing is saved and autosave pauses until you save manually. Reloading the page " +
-            "would load the other changes but discard this page's unsaved changes.";
+            "would load the other changes but discard this page's unsaved changes.", problem);
+    }
+
+    // Asks before the first save to a file name changed this session. Returns true if the user agreed to
+    // replace the file's current contents.
+    async confirmReplace(target: SaveTarget, handle: FileSystemFileHandle): Promise<boolean> {
+        const file = await handle.getFile();
+        const isOurs = file.size === 0
+            || (this.prevPageHash !== undefined && await hashToString(await file.text()) === this.prevPageHash);
+        if (!isOurs) {
+            const problem = `"${handle.name}" already exists and wasn't saved by this page`;
+            await this.askToOverwrite(`${problem}. It may be a different wiki.\n\n` +
+                "Replace it with this wiki? Its current contents are kept in the backups folder.\n\n" +
+                "If you cancel, nothing is saved and autosave pauses until you save manually. You can change " +
+                "the wiki file name in the saver settings.", problem);
+        }
+        target.confirmReplace = false;
+        return !isOurs;
+    }
+
+    askToOverwrite(message: string, problem: string): Promise<void> {
         if (window.confirm(message)) {
-            logDebug("User chose to overwrite the changed file");
+            logDebug("User chose to overwrite the file");
             return Promise.resolve();
         }
         // Otherwise every autosave would ask again.
@@ -723,13 +770,18 @@ class FileSystemSaver implements TWSaver {
         return this.wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(CHECK_CONSISTENCY_FIELD) === YES;
     }
 
-    // beforeWrite runs once the consistency check has passed, just before the wiki file is overwritten.
-    async saveFile(wikiFile: Promise<FileSystemFileHandle>, text: string, beforeWrite?: () => Promise<void>) {
+    // beforeWrite runs once the checks have passed, just before the wiki file is overwritten.
+    async saveFile(target: SaveTarget, text: string, beforeWrite?: () => Promise<void>) {
+        const wikiFile = target.wikiFile;
         const handle = await wikiFile;
         const textHashProm = hashToString(text);
 
         await withSaveLock(async () => {
-            if (this.shouldCheckConsistency()) {
+            // Done regardless of the consistency setting, since this is about replacing a different file.
+            const userAgreedToReplace = target.confirmReplace ? await this.confirmReplace(target, handle) : false;
+            if (userAgreedToReplace) {
+                logDebug("Skipping consistency check since the user agreed to replace the file");
+            } else if (this.shouldCheckConsistency()) {
                 await this.checkConsistency(wikiFile);
             } else {
                 logDebug("Skipping consistency check");
@@ -750,31 +802,29 @@ class FileSystemSaver implements TWSaver {
     }
 
     async saveBackup(target: SaveTarget, text: string) {
-        const textHashProm = hashToString(text);
         const dirHandle = await target.dirHandle!;
+        const wikiFileHandle = await target.wikiFile;
         const backupDir = await dirHandle.getDirectoryHandle(BACKUP_FOLDER_NAME, {
             create: true
         });
-        const wikiFileName = (await target.wikiFile).name;
-        const wikiBackupDir = await backupDir.getDirectoryHandle(wikiFileName, {
+        const wikiBackupDir = await backupDir.getDirectoryHandle(wikiFileHandle.name, {
             create: true
         });
 
-        const textHash = await textHashProm;
-        const backupFileName = `${textHash}.html`;
-        logDebug("Backing up wiki file to %o", backupFileName);
-        const backupFile = await wikiBackupDir.getFileHandle(backupFileName, {
-            create: true
-        });
-
-        await writeFile(backupFile, text);
+        // Also keep what is in the file now, which may not be from this page (e.g. the user agreed to
+        // overwrite another tab's changes or to replace another file).
+        const currentFile = await wikiFileHandle.getFile();
+        if (currentFile.size > 0) {
+            await writeBackup(wikiBackupDir, await currentFile.text(), true);
+        }
+        await writeBackup(wikiBackupDir, text, false);
         logDebug("Wrote backup successfully");
     }
 
     async saveWithDirBackup(target: SaveTarget, text: string) {
         // Write the backup only if the user didn't decline overwriting a changed file, but before the wiki
         // file since the backup doesn't overwrite anything.
-        await this.saveFile(target.wikiFile, text, () => this.saveBackup(target, text));
+        await this.saveFile(target, text, () => this.saveBackup(target, text));
     }
 
     save(text: string, method: SaverCapability, callback: TWSaverCB) {
@@ -802,7 +852,7 @@ class FileSystemSaver implements TWSaver {
         let doSave: () => Promise<void>;
         switch (saverStyle) {
             case SaverStyle.SingleFile:
-                doSave = () => this.saveFile(target.wikiFile, text);
+                doSave = () => this.saveFile(target, text);
                 break;
             case SaverStyle.SingleFileVersionBackup:
                 doSave = () => this.saveWithDirBackup(target, text);

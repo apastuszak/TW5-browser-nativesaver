@@ -42,7 +42,9 @@ The wiki filename is the "Wiki file name" setting if set, otherwise the name of
 the file you opened the wiki from (so renaming the wiki doesn't switch saving to
 another file). When the wiki isn't opened from a file, it falls back to the
 download saver's file name or the site title. Changing the setting takes effect
-on the next save.
+on the next save; if a file with the new name already exists, you are asked
+before it is replaced. Before the wiki file is overwritten, its current contents
+are also kept as a backup if they aren't already.
 
 # Updating TW5 Version
 
