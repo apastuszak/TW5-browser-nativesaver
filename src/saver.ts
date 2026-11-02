@@ -661,9 +661,6 @@ class FileSystemSaver implements TWSaver {
         capabilities: [SaverCapability.Save, SaverCapability.AutoSave]
     };
     private target?: SaveTarget;
-    // Hash of the last text this page successfully wrote, and the file it was written to.
-    private prevPageHash?: string;
-    private prevWikiFile?: Promise<FileSystemFileHandle>;
     // TiddlyWiki doesn't wait for one save to finish before starting the next, so saves are chained.
     private saveQueue: Promise<void> = Promise.resolve();
     // The newest save waiting for earlier ones to finish. A newer save to the same target replaces its
@@ -746,14 +743,14 @@ class FileSystemSaver implements TWSaver {
         logDebug("Reading current value to check consistency");
         const file = await readCurrent();
 
-        // Also covers a file this page saved before a rename (and its text includes that version).
-        if (await this.getLastWrittenHash(await wikiFile) === file.hash) {
+        // Looked up by file, not handle, so this also covers the file being picked again after a reset, and
+        // a file saved before a rename.
+        const lastWrittenHash = await this.getLastWrittenHash(await wikiFile);
+        if (lastWrittenHash === file.hash) {
             logDebug("File holds what this page last wrote to it, so saving is safe");
             return;
-        }
-
-        if (this.prevWikiFile === wikiFile) {
-            logDebug("Expected hash to be [%s] but it is currently [%s]", this.prevPageHash, file.hash);
+        } else if (lastWrittenHash !== undefined) {
+            logDebug("Expected hash to be [%s] but it is currently [%s]", lastWrittenHash, file.hash);
             return this.confirmOverwrite("The wiki file no longer contains what this page last saved");
         }
 
@@ -868,9 +865,7 @@ class FileSystemSaver implements TWSaver {
         });
 
         // Only remember the new hash once the file actually contains this text.
-        this.prevPageHash = await textHashProm;
-        this.prevWikiFile = wikiFile;
-        await this.setLastWrittenHash(handle, this.prevPageHash);
+        await this.setLastWrittenHash(handle, await textHashProm);
     }
 
     async saveBackup(target: SaveTarget, text: string, textHash: string, readCurrent: () => Promise<FileContents>) {
@@ -887,7 +882,7 @@ class FileSystemSaver implements TWSaver {
         // overwrite another tab's changes or to replace another file). Not needed if it still holds what
         // this page last wrote to it, since that save also wrote its backup.
         const current = await readCurrent();
-        const unchangedSinceOurSave = this.prevWikiFile === target.wikiFile && current.hash === this.prevPageHash;
+        const unchangedSinceOurSave = await this.getLastWrittenHash(wikiFileHandle) === current.hash;
         if (current.size > 0 && !unchangedSinceOurSave) {
             await writeBackup(wikiBackupDir, current.text, current.hash, true);
         }
