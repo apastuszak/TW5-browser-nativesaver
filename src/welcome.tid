@@ -3,7 +3,7 @@ tags:
 
 \define tmSaveWikiHelper()
 <!-- <$action-sendmessage $message="tm-save-tiddler" $param="$:/plugins/slaymaker1907/browser-nativesaver/welcome/settings-data" /> -->
-<$action-sendmessage $message="tm-save-wiki" $ />
+<$action-sendmessage $message="tm-save-wiki" />
 <$action-sendmessage $message="tm-close-tiddler" />
 \end
 

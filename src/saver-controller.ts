@@ -57,7 +57,7 @@ class SaverControllerWidget extends Widget {
 		this.execute();
 
 		this.addEventListener("ns-reset-file-saver", () => {
-			Saver.getCurrentSaver().reset();
+			Saver.reset();
 			return false;
 		});
 

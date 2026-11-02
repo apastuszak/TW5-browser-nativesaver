@@ -1,4 +1,6 @@
 const fs = require("fs/promises");
+const fsSync = require("fs");
+const os = require("os");
 const path = require("path");
 const mkdirp = require("mkdirp");
 const { spawn } = require("child_process");
@@ -65,20 +67,15 @@ function runBuildCmd(cmd, args = [], opts = {}) {
     });
 }
 
-// This function should never throw an exception.
+// This function should never throw an exception. Returns arguments for runBuildCmd.
 async function getTscCmd() {
     console.log("Determining what command for tsc should be.");
     const getDefaultTsc = () => {
-        try {
-            const platform = process.platform;
-            const result = platform === "win32" ? "tsc.cmd" : "tsc";
-            console.log(`Using default tsc command [${result}] for platform [${platform}].`);
-            return result;
-        } catch (err) {
-            console.error("Error using platform to determine tsc command, defaulting to [tsc]");
-            console.error(err);
-            return "tsc";
-        }
+        // Run the locally installed TypeScript with node directly. This uses the version from
+        // package.json and avoids spawning tsc.cmd, which newer versions of node refuse to do on Windows.
+        const tscPath = require.resolve("typescript/bin/tsc");
+        console.log(`Using default tsc [${tscPath}].`);
+        return [process.execPath, [tscPath]];
     };
 
     let configData;
@@ -127,7 +124,8 @@ async function getTscCmd() {
         return getDefaultTsc();
     }
 
-    return command;
+    // Run through a shell so that commands like "npx tsc" work.
+    return [command, [], { shell: true }];
 }
 
 async function compileTypescript() {
@@ -136,7 +134,7 @@ async function compileTypescript() {
     await mkdirProm;
 
     try {
-        await runBuildCmd(tsc);
+        await runBuildCmd(...tsc);
         console.log("Compiled code.");
     } catch (err) {
         console.error("tsc encountered error.")
@@ -166,6 +164,7 @@ async function compileTiddlyWiki() {
         console.log("Compiled TiddlyWiki.");
     } catch (err) {
         console.error("Error running TW5 build script.");
+        throw err;
     }
 }
 
@@ -176,11 +175,21 @@ async function withPluginInInfoFile(cb) {
 
     fileJson.plugins.push("slaymaker1907/browser-nativesaver");
     const newStr = JSON.stringify(fileJson);
+
+    // Put the original file back even if the build is interrupted, since it is tracked by git.
+    const restoreOnSignal = signal => {
+        fsSync.writeFileSync(filePath, fileStr, "utf8");
+        process.exit(128 + os.constants.signals[signal]);
+    };
+    process.once("SIGINT", restoreOnSignal);
+    process.once("SIGTERM", restoreOnSignal);
     try {
         await fs.writeFile(filePath, newStr, "utf8");
         await cb();
     } finally {
         await fs.writeFile(filePath, fileStr, "utf8");
+        process.off("SIGINT", restoreOnSignal);
+        process.off("SIGTERM", restoreOnSignal);
     }
 }
 
@@ -206,4 +215,5 @@ main().then(() => {
     console.error("Could not move files.");
     console.error(err);
     console.trace();
+    process.exitCode = 1;
 });

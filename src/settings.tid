@@ -14,7 +14,7 @@ caption: HTML Native File System Saver
 
 <$checkbox tiddler=<<nativeSaverSettings>> field="allow-indexedDB?" checked="yes" unchecked="no" default="no"> Allow FS to use indexedDB? (some security issues since everything on file:// has the same origin)</$checkbox>
 
-<$checkbox tiddler=<<nativeSaverSettings>> field="check-consistency?" checked="yes" unchecked="no" default="no"> Check consistency to avoid parallel writes?</$checkbox>
+<$checkbox tiddler=<<nativeSaverSettings>> field="check-consistency?" checked="yes" unchecked="no" default="yes"> Check consistency to avoid parallel writes?</$checkbox>
 
 <$select tiddler=<<nativeSaverSettings>> field="save-style" default="single-file">
     <option value="single-file">Single file</option>
@@ -22,10 +22,10 @@ caption: HTML Native File System Saver
 </$select>
 
 <$reveal type="match" stateTitle=<<nativeSaverSettings>> stateField="save-style" text="single-file-version-backup">
-    Wiki file name (same as download saver if empty): <$edit-text tiddler="$:/plugins/slaymaker1907/browser-nativesaver/settings-data" field="wiki-file-name" />
+    Wiki file name (same as download saver if empty): <$edit-text tiddler=<<nativeSaverSettings>> field="wiki-file-name" />
 </$reveal>
 
-<$button onclick="window.indexedDB.deleteDatabase('FileHandles-QqiTNHy4qkN9TtIYbd5i');">
+<$button>
 <$action-sendmessage $message="ns-reset-file-saver" />
 Reset file save location
 </$button>

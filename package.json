@@ -1,6 +1,6 @@
 {
   "name": "tw5-fsa-saver",
-  "version": "0.2.0",
+  "version": "0.8.0",
   "description": "This project uses git-subtree to sync with TiddlyWiki 5 as described\r in https://www.atlassian.com/git/tutorials/git-subtree.",
   "main": "index.js",
   "scripts": {

@@ -68,13 +68,13 @@ interface SaverHandler {
 
 declare const module: {exports: any};
 
-let problemEncountered = false;
 const PLUGIN_NAME = "slaymaker1907/browser-nativesaver";
 const BASE_TIDDLER_PATH = `$:/plugins/${PLUGIN_NAME}`;
 const PLUGIN_SETTINGS_DATA = `${BASE_TIDDLER_PATH}/settings-data`
 const PLUGIN_SETTINGS_TIDDLER = `${BASE_TIDDLER_PATH}/settings`
 const ENABLE_LOGGING_FIELD = "enable-logging?";
 const ENABLE_SAVER_FIELD = "enable-saver?";
+const CHECK_CONSISTENCY_FIELD = "check-consistency?";
 const SAVER_STYLE_FIELD = "save-style";
 const ALLOW_INDEXED_DB_FIELD = "allow-indexedDB?";
 const WIKI_FILENAME_FIELD = "wiki-file-name";
@@ -83,6 +83,7 @@ const YES = "yes";
 const UNIQUE_PLUGIN_ID = "QqiTNHy4qkN9TtIYbd5i";
 const WELCOME_PAGE = "$:/plugins/slaymaker1907/browser-nativesaver/welcome";
 const BACKUP_FOLDER_NAME = "backups";
+const DEFAULT_WIKI_FILENAME = "index.html";
 
 let logDebug = console.log;
 
@@ -128,10 +129,11 @@ const isServedFromFS = () => {
     try {
         const protocol = window.location.protocol;
         logDebug("TiddlyWiki location protocol is [%o]", protocol);
-        return protocol.startsWith
+        return protocol === "file:";
     } catch (err) {
         logDebug("Error occurred trying to determine protocol for TiddlyWiki: %o", err);
         logDebug("Assuming that it is file:/ to maximimize security");
+        return true;
     }
 };
 
@@ -217,6 +219,11 @@ const tryCreateHandleStore = async (wiki: TWWiki) => {
     try {
         const db = await idbRequestToPromise(dbOpenRequest);
         logDebug("Successfully opened database for storing file handles %o.", db)
+        // Otherwise an open connection blocks deleteDatabase (used by reset) in this or other tabs.
+        db.onversionchange = () => {
+            logDebug("File handle DB is being deleted or upgraded, closing connection.");
+            db.close();
+        };
         return db;
     } catch (err) {
         logDebug("Could not open database for storing file handles: %o", err);
@@ -266,7 +273,10 @@ const requestDirectoryHandle = async (startIn?: FileSystemHandle) => {
 }
 
 const getIndexedDBKey = async () => {
-    return CURRENT_FILE_HANDLE_NAME + (await hashToString(window.location.href));
+    // Ignore the fragment since TiddlyWiki changes it when navigating with permalinks.
+    const url = new URL(window.location.href);
+    url.hash = "";
+    return CURRENT_FILE_HANDLE_NAME + (await hashToString(url.href));
 }
 
 interface IndexedDBCacheable<T> {
@@ -274,9 +284,13 @@ interface IndexedDBCacheable<T> {
     oldIsValid(old: any): old is T;
 }
 
-async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheable: IndexedDBCacheable<T>): Promise<T> {
-    let transaction: IDBTransaction;
-    let store: IDBObjectStore;
+interface CachedHandle<T> {
+    handle: T;
+    // True if the user just picked this handle rather than it coming from IndexedDB.
+    isNew: boolean;
+}
+
+async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheable: IndexedDBCacheable<T>): Promise<CachedHandle<T>> {
     let db: IDBDatabase;
 
     const storageKey = await getIndexedDBKey();
@@ -284,13 +298,10 @@ async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheab
 
     try {
         db = await tryCreateHandleStore(wiki);
-        transaction = db.transaction([DB_HANDLE_OBJECT_STORE_NAME], IDB_READONLY);
-        store = transaction.objectStore(DB_HANDLE_OBJECT_STORE_NAME);
     } catch (err) {
         logDebug("Could not get handle store due to error, must request file location from user: %o", err);
-        return await cacheable.requestNew();
+        return { handle: await cacheable.requestNew(), isNew: true };
     }
-    // store must now be initialized
 
     const requestAndStoreNewFile = async () => {
         const handle = await cacheable.requestNew();
@@ -300,10 +311,10 @@ async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheab
         // important.
         try {
             // Have to get a new transaction because requestFileHandle puts us in a new event loop.
-            transaction = db.transaction([DB_HANDLE_OBJECT_STORE_NAME], IDB_READWRITE);
-            store = transaction.objectStore(DB_HANDLE_OBJECT_STORE_NAME);
-            idbRequestToPromise(store.put(handle, storageKey)).then(async () => {
-                await getTransactionCommitPromise(transaction);
+            const transaction = db.transaction([DB_HANDLE_OBJECT_STORE_NAME], IDB_READWRITE);
+            const commitPromise = getTransactionCommitPromise(transaction);
+            transaction.objectStore(DB_HANDLE_OBJECT_STORE_NAME).put(handle, storageKey);
+            commitPromise.then(() => {
                 logDebug("Successfully saved file handle %o to object store.", handle);
             }, err => {
                 logDebug("Could not save file handle %o to object store (user will have to select file once they refresh): %o",
@@ -313,10 +324,12 @@ async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheab
             logDebug("Failed to initate save request for file hande due to error: %o", err);
         }
 
-        return handle;
+        return { handle, isNew: true };
     };
 
     try {
+        const transaction = db.transaction([DB_HANDLE_OBJECT_STORE_NAME], IDB_READONLY);
+        const store = transaction.objectStore(DB_HANDLE_OBJECT_STORE_NAME);
         const maybeFileHandle = await idbRequestToPromise(store.get(storageKey));
         if (!cacheable.oldIsValid(maybeFileHandle)) {
             logDebug("No existing file handle found, must request new one");
@@ -333,10 +346,13 @@ async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheab
         }
         logDebug("Successfully obtained RW permission on file system object.");
 
-        return maybeFileHandle;
+        return { handle: maybeFileHandle, isNew: false };
     } catch (err) {
         logDebug("Could not get previous handle, must request a new one due to error: %o", err);
         return await requestAndStoreNewFile();
+    } finally {
+        // Transactions already started still complete after close.
+        db.close();
     }
 }
 
@@ -362,6 +378,14 @@ const getDirectoryHandle = async (wiki: TWWiki, startHandle?: FileSystemHandle) 
     });
 }
 
+const deleteHandleStore = () => {
+    try {
+        window.indexedDB.deleteDatabase(DB_NAME);
+    } catch(err) {
+        logDebug("Failed to delete file save location: %o", err);
+    }
+};
+
 // Returns a string hash in hex for easy comparison and printing.
 async function hashToString(data: string | ArrayBuffer): Promise<string> {
     let buffer: ArrayBuffer;
@@ -375,10 +399,17 @@ async function hashToString(data: string | ArrayBuffer): Promise<string> {
     // Adapted from example at https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/digest
     const hashBytes = await window.crypto.subtle.digest("SHA-256", buffer);
     const hashArray = Array.from(new Uint8Array(hashBytes));
-    const hexChars = hashArray.map(byte => byte.toString(16))
+    return hashArray.map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
 
-    // Pad in case hash is small.
-    return hexChars.join("").padStart(64, "0");
+// Replaces characters that are invalid in file names on at least one major OS.
+function sanitizeFileName(name: string): string {
+    const result = name
+        .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+        .trim()
+        // Windows does not allow trailing dots or spaces, this also gets rid of "." and "..".
+        .replace(/[. ]+$/, "");
+    return result === "" ? DEFAULT_WIKI_FILENAME : result;
 }
 
 async function getWikiFileName(wiki: TWWiki): Promise<string> {
@@ -389,15 +420,52 @@ async function getWikiFileName(wiki: TWWiki): Promise<string> {
         const siteTitle = wiki.getTiddler("$:/SiteTitle");
 
         if (wikiButtonFilename) {
-            return wikiButtonFilename.getFieldString("text").trim();
+            return sanitizeFileName(wikiButtonFilename.getFieldString("text"));
         } else if (siteTitle) {
-            return `${siteTitle.getFieldString("text").trim()}.html`;
+            return sanitizeFileName(`${siteTitle.getFieldString("text").trim()}.html`);
         } else {
-            return "index.html"
+            return DEFAULT_WIKI_FILENAME;
         }
     } else {
-        return explicitName.trim();
+        return sanitizeFileName(explicitName);
     }
+}
+
+async function writeFile(handle: FileSystemFileHandle, text: string) {
+    const writable = await handle.createWritable();
+    try {
+        await writable.write(text);
+    } catch (err) {
+        // Closing would commit a partially written file, so throw away the changes instead.
+        await writable.abort();
+        throw err;
+    }
+    await writable.close();
+}
+
+// Lets the user explicitly overwrite a file which was changed elsewhere, rejecting if they decline.
+function confirmOverwrite(problem: string): Promise<void> {
+    const message = `${problem}, maybe by another tab or program.\n\n` +
+        "Overwrite it anyway? Any changes made there will be lost. Cancel and reload the page to keep them.";
+    if (window.confirm(message)) {
+        logDebug("User chose to overwrite the changed file");
+        return Promise.resolve();
+    }
+    return Promise.reject(`${problem}. Reload the page to get the latest version before saving`);
+}
+
+interface WikiFile {
+    handle: FileSystemFileHandle;
+    // True if the user picked this exact file this session, confirming it may be overwritten.
+    pickedByUser: boolean;
+}
+
+// The handles for one save location, captured when a save starts so that a reset or style change
+// doesn't affect saves which are already queued.
+interface SaveTarget {
+    style: SaverStyle;
+    wikiFile: Promise<WikiFile>;
+    dirHandle?: Promise<FileSystemDirectoryHandle>;
 }
 
 class FileSystemSaver implements TWSaver {
@@ -406,114 +474,124 @@ class FileSystemSaver implements TWSaver {
         priority: 100000,
         capabilities: [SaverCapability.Save, SaverCapability.AutoSave]
     };
-    private initError: any = null;
-    private fileHandle?: Promise<FileSystemFileHandle>;
-    private prevPageHash?: Promise<string>;
-    private dirHandle?: Promise<FileSystemDirectoryHandle>;
-    private backupSaveProm: Promise<void> = Promise.resolve();
+    private target?: SaveTarget;
+    // Hash of the last text this page successfully wrote, and the file it was written to.
+    private prevPageHash?: string;
+    private prevWikiFile?: Promise<WikiFile>;
+    // TiddlyWiki doesn't wait for one save to finish before starting the next, so saves are chained.
+    private saveQueue: Promise<void> = Promise.resolve();
 
     constructor(private wiki: TWWiki) {
         setupLogging(wiki);
         logDebug("Constructing a FileSystemSaver");
     }
 
-    userInteractionInit() {
-        if (this.fileHandle) {
-            return;
+    // Must be called synchronously from save so that the browser allows showing file pickers.
+    userInteractionInit(saverStyle: SaverStyle): SaveTarget {
+        if (this.target && this.target.style === saverStyle) {
+            return this.target;
         }
 
-        // const saverStyle = getSaverStyle(this.wiki);
-        if (getSaverStyle(this.wiki) === SaverStyle.SingleFile) {
+        let target: SaveTarget;
+        if (saverStyle === SaverStyle.SingleFile) {
             logDebug("Attempting to get file handle.");
 
-            this.fileHandle = getFileHandle(this.wiki);
-            this.fileHandle.catch(err => {
-                problemEncountered = true;
-                this.initError = err;
-                logDebug("Could not get file handle due to error: %o", err);
-            });
+            target = {
+                style: saverStyle,
+                wikiFile: getFileHandle(this.wiki).then(cached => ({
+                    handle: cached.handle,
+                    pickedByUser: cached.isNew
+                }))
+            };
         } else {
             logDebug("Attempting to get directory handle.");
 
-            this.dirHandle = getDirectoryHandle(this.wiki);
-            this.fileHandle = this.dirHandle.then(async actualDirHandle => {
-                const wikiFileName = await getWikiFileName(this.wiki);
-                logDebug("Filename of wiki is: %o", wikiFileName);
-                return actualDirHandle.getFileHandle(wikiFileName, {
-                    create: true
-                });
-            });
+            const dirHandle = getDirectoryHandle(this.wiki).then(cached => cached.handle);
+            target = {
+                style: saverStyle,
+                dirHandle,
+                wikiFile: dirHandle.then(async actualDirHandle => {
+                    const wikiFileName = await getWikiFileName(this.wiki);
+                    logDebug("Filename of wiki is: %o", wikiFileName);
+                    const handle = await actualDirHandle.getFileHandle(wikiFileName, {
+                        create: true
+                    });
+                    return { handle, pickedByUser: false };
+                })
+            };
         }
+
+        target.wikiFile.catch(err => {
+            logDebug("Could not get file handle due to error: %o", err);
+            // Forget the failed request so that the next save asks again.
+            if (this.target === target) {
+                this.target = undefined;
+            }
+        });
+
+        this.target = target;
+        return target;
     }
 
-    async checkConsistency(newText: string) {
-        if (!this.shouldCheckConsistency()) {
-            logDebug("Skipping consistency check since it is disabled");
-            return;
-        }
-
-        if (!this.prevPageHash) {
-            logDebug("No previous known hash to compare against");
-            this.prevPageHash = hashToString(newText);
-            return;
-        }
-
-        const handle = await this.fileHandle!;
+    async checkConsistency(wikiFile: Promise<WikiFile>) {
+        const { handle, pickedByUser } = await wikiFile;
         logDebug("Reading current value to check consistency");
-        const reader = await handle.getFile();
-        const currentText = await reader.text();
-        const currentHash = await hashToString(currentText);
-        const prevHash = await this.prevPageHash;
-        if (currentHash !== prevHash) {
-            logDebug("Expected hash to be [%s] but it is currently [%s]", prevHash, currentHash);
-            problemEncountered = true;
-            const err = "Previous page source does not match the current text"
-            return Promise.reject(err);
+        const file = await handle.getFile();
+
+        if (this.prevPageHash !== undefined) {
+            const currentHash = await hashToString(await file.text());
+            if (currentHash === this.prevPageHash) {
+                logDebug("Previous value matches the current value so saving is safe");
+                return;
+            }
+
+            if (this.prevWikiFile === wikiFile) {
+                logDebug("Expected hash to be [%s] but it is currently [%s]", this.prevPageHash, currentHash);
+                return confirmOverwrite("The wiki file no longer contains what this page last saved");
+            }
         }
 
-        logDebug("Previous value matches the current value so saving is safe");
-        logDebug("Computing hash of text to save...");
-        this.prevPageHash = hashToString(newText);
-
-        return {
-            fileHash: currentHash,
-            fileText: currentText
-        };
+        // This is the first save to this file, so check the file wasn't saved after this page loaded.
+        if (pickedByUser) {
+            logDebug("User picked this file, so overwriting it is expected");
+        } else if (file.size === 0) {
+            logDebug("File is empty, so saving is safe");
+        } else if (file.lastModified > performance.timeOrigin) {
+            logDebug("File was modified at %o which is after page load at %o", file.lastModified, performance.timeOrigin);
+            return confirmOverwrite("The wiki file was modified after this page was loaded");
+        }
     }
 
     shouldCheckConsistency() {
-        return this.wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(ENABLE_SAVER_FIELD) === YES;
+        return this.wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(CHECK_CONSISTENCY_FIELD) === YES;
     }
 
-    async saveFile(text: string) {
-        const handle = await this.fileHandle!;
+    async saveFile(wikiFile: Promise<WikiFile>, text: string) {
+        const { handle } = await wikiFile;
+        const textHashProm = hashToString(text);
 
         if (this.shouldCheckConsistency()) {
-            await this.checkConsistency(text);
+            await this.checkConsistency(wikiFile);
         } else {
             logDebug("Skipping consistency check");
         }
 
-        logDebug("Creating writable...");
-        const writable = await handle.createWritable();
-        logDebug("Created writable");
+        logDebug("Writing wiki file...");
+        await writeFile(handle, text);
+        logDebug("Wrote wiki file successfully");
 
-        try {
-            await writable.write(text);
-            logDebug("Wrote data successfully");
-        } finally {
-            await writable.close();
-            logDebug("Closed writable");
-        }
+        // Only remember the new hash once the file actually contains this text.
+        this.prevPageHash = await textHashProm;
+        this.prevWikiFile = wikiFile;
     }
 
-    async saveBackup(text: string) {
+    async saveBackup(target: SaveTarget, text: string) {
         const textHashProm = hashToString(text);
-        const dirHandle = await this.dirHandle!;
+        const dirHandle = await target.dirHandle!;
         const backupDir = await dirHandle.getDirectoryHandle(BACKUP_FOLDER_NAME, {
             create: true
         });
-        const wikiFileName = await (await this.fileHandle!).name;
+        const wikiFileName = (await target.wikiFile).handle.name;
         const wikiBackupDir = await backupDir.getDirectoryHandle(wikiFileName, {
             create: true
         });
@@ -525,25 +603,14 @@ class FileSystemSaver implements TWSaver {
             create: true
         });
 
-        const backupWriter = await backupFile.createWritable();
-        try {
-            await backupWriter.write(text);
-            logDebug("Wrote backup successfully");
-        } finally {
-            await backupWriter.close();
-        }
+        await writeFile(backupFile, text);
+        logDebug("Wrote backup successfully");
     }
 
-    async saveWithDirBackup(text: string) {
-        // First start save to new folder since that doesn't overwrite anything.
-        const newBackupProm = this.saveBackup(text);
-
-        // Now wait for last backup to complete.
-        await this.backupSaveProm;
-
-        this.backupSaveProm = newBackupProm;
-
-        return this.saveFile(text);
+    async saveWithDirBackup(target: SaveTarget, text: string) {
+        // Save to the backup folder first since that doesn't overwrite anything.
+        await this.saveBackup(target, text);
+        await this.saveFile(target.wikiFile, text);
     }
 
     save(text: string, method: SaverCapability, callback: TWSaverCB) {
@@ -553,34 +620,38 @@ class FileSystemSaver implements TWSaver {
             return false;
         }
 
-        logDebug("Saving with method %o", method);
-        this.userInteractionInit();
-
-        if (this.initError !== null) {
-            logDebug("Encountered init, can't save");
-            callback(this.initError);
-            return false;
+        const saverStyle = getSaverStyle(this.wiki);
+        if (method === SaverCapability.AutoSave && (!this.target || this.target.style !== saverStyle)) {
+            // Browsers only allow file pickers and permission prompts in response to a click. Claim the
+            // save without calling back so the wiki stays dirty and other savers don't take over.
+            logDebug("Skipping autosave until the save location is set up by a manual save.");
+            return true;
         }
 
-        const saverStyle = getSaverStyle(this.wiki);
-        let savePromise: Promise<void>;
+        logDebug("Saving with method %o", method);
+        const target = this.userInteractionInit(saverStyle);
+
+        let doSave: () => Promise<void>;
         switch (saverStyle) {
             case SaverStyle.SingleFile:
-                savePromise = this.saveFile(text);
+                doSave = () => this.saveFile(target.wikiFile, text);
                 break;
             case SaverStyle.SingleFileVersionBackup:
-                savePromise = this.saveWithDirBackup(text);
+                doSave = () => this.saveWithDirBackup(target, text);
                 break;
             default:
-                callback(`Unsupported SaverStyle: [${saverStyle}]`);
+                logDebug("Unsupported SaverStyle: [%s]", saverStyle);
                 return false;
         }
+
+        const savePromise = this.saveQueue.then(doSave);
+        // Keep the queue going even if this save fails.
+        this.saveQueue = savePromise.catch(() => {});
 
         savePromise.then(() => {
             logDebug("Successfully saved to file system");
             callback(null);
         }, err => {
-            problemEncountered = true;
             logDebug("Encountered error while saving: %o", err);
             callback(`Encountered error while saving to file system: [${err}]`);
         });
@@ -590,15 +661,9 @@ class FileSystemSaver implements TWSaver {
 
     reset() {
         logDebug("Reseting file saver...");
-        try {
-            window.indexedDB.deleteDatabase(DB_NAME);
-        } catch(err) {
-            logDebug("Failed to delete file save location: %o", err);
-        }
+        deleteHandleStore();
         setupLogging(this.wiki);
-        this.fileHandle = undefined;
-        this.initError = null;
-        this.prevPageHash = undefined;
+        this.target = undefined;
         logDebug("Reset file save location.");
     }
 }
@@ -607,7 +672,7 @@ class FileSystemSaver implements TWSaver {
 const canSave = (handler: SaverHandler) => {
     try {
         setupLogging(handler.wiki);
-        return isEnabled(handler.wiki) && (!!window.showOpenFilePicker) && window.isSecureContext && !problemEncountered;
+        return isEnabled(handler.wiki) && (!!window.showSaveFilePicker) && window.isSecureContext;
     } catch(err) {
         logDebug(err);
         return false;
@@ -635,8 +700,18 @@ const create = (wiki: TWWiki) => {
     return result;
 };
 
+// Works even if the saver was never created (e.g. it was disabled at startup).
+const reset = () => {
+    if (currentSaver) {
+        currentSaver.reset();
+    } else {
+        deleteHandleStore();
+    }
+};
+
 module.exports = {
     canSave,
     create,
+    reset,
     getCurrentSaver: () => currentSaver
 };

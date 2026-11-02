@@ -5,7 +5,13 @@ and import into your wiki.
 
 On startup, a modal is displayed with file saver settings. Note that it
 is recommended to leave the consistency check on. This helps avoid concurrent
-writes such as happens when the same wiki is open in separate tabs.
+writes such as happens when the same wiki is open in separate tabs. If the
+file was changed elsewhere, you are asked whether to overwrite it. Cancel and
+reload the page to keep the other changes instead.
+
+Browsers only show the file picker in response to a click, so autosave does
+nothing until you save manually once (e.g. with the Save button in the
+welcome modal). After that, autosave works as normal.
 
 Allowing IndexedDB usage when the wiki is loaded from file:// instead
 of a webserver is a potential security issue. Chromium based browsers
@@ -17,7 +23,7 @@ is not enough to exploit this vulnerability.
 
 It is recommended to backup the location where you store your wiki regularly.
 However, the single file with versioned backup saver style saves each version
-of your wiki under /{selected folder}/backups/{wiki filename/{version hash}.html.
+of your wiki under /{selected folder}/backups/{wiki filename}/{version hash}.html.
 
 # Updating TW5 Version
 
