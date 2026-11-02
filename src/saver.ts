@@ -60,6 +60,9 @@ interface TWWiki {
     getTiddler(name: string): Tiddler|undefined;
     addTiddler(tiddler: any): void;
     addEventListener(type: "change", listener: (changes: {[title: string]: unknown}) => void): void;
+    getChangeCount(title: string): number;
+    // Changes not yet sent to "change" listeners (TiddlyWiki internals).
+    changedTiddlers?: {[title: string]: unknown};
     modal: TWModalManager;
 }
 
@@ -67,6 +70,8 @@ interface TWWiki {
 interface TWSaverHandlerInternals {
     numChanges: number;
     updateDirtyStatus(): void;
+    // Compiled filter for which changed tiddlers count as unsaved changes.
+    filterFn(source: (iterator: (tiddler: Tiddler | undefined, title: string) => void) => void): string[];
 }
 
 interface SaverHandler {
@@ -454,7 +459,8 @@ function withSaveLock<T>(callback: () => Promise<T>): Promise<T> {
 function getCoreSaverHandler(): TWSaverHandlerInternals | undefined {
     const tw = (window as any).$tw;
     const handler = tw && tw.saverHandler;
-    if (handler && typeof handler.numChanges === "number" && typeof handler.updateDirtyStatus === "function") {
+    if (handler && typeof handler.numChanges === "number" && typeof handler.updateDirtyStatus === "function"
+            && typeof handler.filterFn === "function") {
         return handler;
     }
     return undefined;
@@ -640,7 +646,8 @@ class FileSystemSaver implements TWSaver {
         return this.wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(CHECK_CONSISTENCY_FIELD) === YES;
     }
 
-    async saveFile(wikiFile: Promise<FileSystemFileHandle>, text: string) {
+    // beforeWrite runs once the consistency check has passed, just before the wiki file is overwritten.
+    async saveFile(wikiFile: Promise<FileSystemFileHandle>, text: string, beforeWrite?: () => Promise<void>) {
         const handle = await wikiFile;
         const textHashProm = hashToString(text);
 
@@ -649,6 +656,10 @@ class FileSystemSaver implements TWSaver {
                 await this.checkConsistency(wikiFile);
             } else {
                 logDebug("Skipping consistency check");
+            }
+
+            if (beforeWrite) {
+                await beforeWrite();
             }
 
             logDebug("Writing wiki file...");
@@ -684,9 +695,9 @@ class FileSystemSaver implements TWSaver {
     }
 
     async saveWithDirBackup(target: SaveTarget, text: string) {
-        // Save to the backup folder first since that doesn't overwrite anything.
-        await this.saveBackup(target, text);
-        await this.saveFile(target.wikiFile, text);
+        // Write the backup only if the user didn't decline overwriting a changed file, but before the wiki
+        // file since the backup doesn't overwrite anything.
+        await this.saveFile(target.wikiFile, text, () => this.saveBackup(target, text));
     }
 
     save(text: string, method: SaverCapability, callback: TWSaverCB) {
@@ -724,11 +735,7 @@ class FileSystemSaver implements TWSaver {
                 return false;
         }
 
-        // TiddlyWiki counts changes in a setTimeout, so wait for changes made just before this save (e.g. by
-        // the same button) to be counted.
-        const changesIncluded = new Promise<number | undefined>(resolve => {
-            window.setTimeout(() => resolve(this.getTotalChanges()), 0);
-        });
+        const changesIncluded = this.snapshotIncludedChanges();
         const savePromise = this.saveQueue.then(() => {
             // Checked here too since the user may decline an overwrite while this save is queued.
             if (method === SaverCapability.AutoSave && this.autosaveSuspended) {
@@ -753,6 +760,34 @@ class FileSystemSaver implements TWSaver {
         });
 
         return true;
+    }
+
+    // Works out how many changes the text being saved includes, as a total comparable with getTotalChanges.
+    // TiddlyWiki counts changes in batches, in a setTimeout after they are made, so changes made just
+    // before this save (e.g. by the same button) are queued but not counted yet. They are in the text, but
+    // changes queued after this save in the same batch aren't.
+    snapshotIncludedChanges(): Promise<number | undefined> {
+        const handler = getCoreSaverHandler();
+        const totalChanges = this.getTotalChanges();
+        if (!handler || totalChanges === undefined || typeof this.wiki.getChangeCount !== "function") {
+            return Promise.resolve(totalChanges);
+        }
+
+        const queuedTitles = Object.keys(this.wiki.changedTiddlers || {});
+        const queuedChanges = handler.filterFn(iterator => {
+            queuedTitles.forEach(title => iterator(this.wiki.getTiddler(title), title));
+        });
+        const changeCounts = queuedChanges.map(title => this.wiki.getChangeCount(title));
+
+        return new Promise(resolve => {
+            // This runs after the batch is counted, since that setTimeout was started first.
+            window.setTimeout(() => {
+                // A batch counts each tiddler once, so a queued tiddler changed again after this save would
+                // look saved.
+                const changedAgain = queuedChanges.filter((title, i) => this.wiki.getChangeCount(title) > changeCounts[i]);
+                resolve(totalChanges + queuedChanges.length - changedAgain.length);
+            }, 0);
+        });
     }
 
     getTotalChanges(): number | undefined {
@@ -791,10 +826,31 @@ class FileSystemSaver implements TWSaver {
     }
 }
 
+let handleCleanupRegistered = false;
+
+// Don't leave a handle readable by other pages once storing it is disallowed. This must run even when
+// the saver is disabled, so it is set up from canSave, which TiddlyWiki calls once at startup.
+const registerHandleCleanup = (wiki: TWWiki) => {
+    if (handleCleanupRegistered) {
+        return;
+    }
+    handleCleanupRegistered = true;
+
+    if (!canUseIndexedDB(wiki)) {
+        removeCachedHandleInBackground();
+    }
+    wiki.addEventListener("change", changes => {
+        if (changes[PLUGIN_SETTINGS_DATA] && !canUseIndexedDB(wiki)) {
+            removeCachedHandleInBackground();
+        }
+    });
+};
+
 // Has one parameter, wiki if necessary
 const canSave = (handler: SaverHandler) => {
     try {
         setupLogging(handler.wiki);
+        registerHandleCleanup(handler.wiki);
         return isEnabled(handler.wiki) && (!!window.showSaveFilePicker) && window.isSecureContext;
     } catch(err) {
         logDebug(err);
@@ -808,16 +864,6 @@ let currentSaver: FileSystemSaver | null = null;
 const create = (wiki: TWWiki) => {
     const result = new FileSystemSaver(wiki);
     currentSaver = result;
-
-    // Don't leave a handle readable by other pages once storing it is disallowed.
-    if (!canUseIndexedDB(wiki)) {
-        removeCachedHandleInBackground();
-    }
-    wiki.addEventListener("change", changes => {
-        if (changes[PLUGIN_SETTINGS_DATA] && !canUseIndexedDB(wiki)) {
-            removeCachedHandleInBackground();
-        }
-    });
 
     // Wait one event cycle before trying to show the welcome page.
     window.setTimeout(() => {
