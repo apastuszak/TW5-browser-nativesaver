@@ -1,0 +1,49 @@
+# AGENTS.md
+
+TiddlyWiki 5 plugin (`$:/plugins/slaymaker1907/browser-nativesaver`) that saves a single-file wiki to disk with the File System Access API. Only Chromium-based browsers support that API.
+
+## Layout
+
+- `src/` is the plugin source and the only code you normally edit.
+  - `saver.ts`: the `saver` module (all save logic).
+  - `saver-controller.ts`: a widget that handles the `ns-reset-file-saver` message.
+  - `*.tid`, `plugin.info`: settings UI, default settings, welcome modal, plugin metadata.
+- `TiddlyWiki5/` is a git subtree of upstream TiddlyWiki. Don't edit it; update it with the subtree commands in `README.md`.
+- `example-wiki.html` is the downloadable demo: an empty TiddlyWiki 5.2.1 with the plugin embedded.
+- `build/`, `tw5.html` and `TiddlyWiki5/plugins/slaymaker1907/` are build output and are ignored by git.
+
+## Commands
+
+- `npm install`, then `npm run build` (runs `build.js`). This compiles TypeScript with the local `typescript` package, copies the plugin into `TiddlyWiki5/plugins/slaymaker1907/`, builds the tw5.com edition with the plugin and copies the result to `tw5.html`.
+- Type-check only: `npx tsc --noEmit -p .`
+- There is no automated test suite (`npm test` is a placeholder). The File System Access API needs a real Chromium browser, so check behaviour by hand in `tw5.html` or `example-wiki.html`.
+
+## Conventions
+
+- **Line endings:** `src/*`, `build.js` and `README.md` use CRLF. Keep CRLF when you edit them. Many scripted edits silently convert to LF.
+- **Module format:** `tsconfig.json` uses `"module": "None"`, so source files can't use `import`/`export`. Each file is a TiddlyWiki module: the `/*\ title: ... module-type: ... \*/` header becomes the tiddler, `require` takes TiddlyWiki module titles, and exports go through `module.exports`.
+- **Settings:** setting names (`enable-saver?`, `check-consistency?`, `save-style`, ...) are fields on `.../settings-data`. The constants in `saver.ts`, the defaults in `settings-data.tid` and the checkbox `default`s in `settings.tid` must all agree.
+- **Versioning:** keep the version in `src/plugin.info` and `package.json` the same. TiddlyWiki only replaces an installed plugin with a newer version, so bump it for every release.
+
+## How saving works (things that are easy to break)
+
+- **Click requirement:** browsers only show file pickers and permission prompts in response to a user click. `userInteractionInit` must run synchronously inside `save()`, never after an `await`. Autosave is skipped, and `save()` returns `true` without calling the callback, until a manual save has set up a location for the current save style. Returning `false` would let TiddlyWiki hand the save to a lower-priority saver.
+- **Return value:** if `save()` returns `true` it owns the callback. If it returns `false`, TiddlyWiki tries the next saver, so don't call the callback in that case.
+- **One save at a time:** TiddlyWiki starts saves without waiting for earlier ones to finish. Saves are chained on `saveQueue`. Each save captures its `SaveTarget` up front, so a reset or style change doesn't affect saves already queued.
+- **Consistency check:**
+  - `prevPageHash` is recorded only after a write succeeds.
+  - Writes go through `writeFile`, which aborts (rather than closes) the writable on failure, because closing commits a partial file.
+  - On the first save to a file, the check compares the file's `lastModified` with `performance.timeOrigin`. It skips this when the user picked that exact file in this session, or when the file is empty.
+  - If the file changed elsewhere, the user is asked to confirm the overwrite (`confirmOverwrite`).
+- **Remembering the location:** the chosen file or directory handle is cached in IndexedDB, keyed by a hash of the page URL without its `#fragment`. Close database connections after use, because an open connection blocks `deleteDatabase` and makes reset hang.
+- **Security:** every `file://` page shares one origin in Chromium, so any local HTML file could read the cached handles. IndexedDB is therefore off on `file://` unless the user enables `allow-indexedDB?`, and `isServedFromFS` must fail closed (return `true` on error).
+- **TiddlyWiki behaviour:** core calls `canSave` only once, at startup. State that should change behaviour at runtime has to be checked in `save()`.
+
+## Updating example-wiki.html
+
+`npm run build` does not update `example-wiki.html`. When releasing, replace only the `$:/plugins/slaymaker1907/browser-nativesaver` tiddler in its `tiddlywiki-tiddler-store` JSON with the one from the freshly built `tw5.html` (escape `<` as `<`, as TiddlyWiki does). Don't re-render the whole file with the subtree's TiddlyWiki, which is an unreleased prerelease version.
+
+## Git
+
+- Default branch is `main`.
+- Don't commit build output or `local-config.toml`. `local-config.toml` holds a per-machine override, `[tsc] command`.
