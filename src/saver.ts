@@ -575,12 +575,17 @@ function getWikiFileName(wiki: TWWiki): string {
 
 // Backups are named by the hash of their text, so the same version is only stored once.
 async function writeBackup(backupDir: FileSystemDirectoryHandle, text: string, skipIfExists: boolean) {
-    const backupFileName = `${await hashToString(text)}.html`;
+    const textHash = await hashToString(text);
+    const backupFileName = `${textHash}.html`;
     if (skipIfExists) {
         try {
-            await backupDir.getFileHandle(backupFileName);
-            logDebug("Backup %o already exists", backupFileName);
-            return;
+            const existing = await (await backupDir.getFileHandle(backupFileName)).getFile();
+            // A failed write can leave an empty or partial file behind, which isn't a backup.
+            if (await hashToString(await existing.text()) === textHash) {
+                logDebug("Backup %o already exists", backupFileName);
+                return;
+            }
+            logDebug("Backup %o is incomplete, writing it again", backupFileName);
         } catch (err) {
             if (!err || (err as { name?: unknown }).name !== "NotFoundError") {
                 throw err;
@@ -740,7 +745,8 @@ class FileSystemSaver implements TWSaver {
     }
 
     // Asks before the first save to a file name changed this session. Returns true if the user agreed to
-    // replace the file's current contents.
+    // replace the file's current contents. The caller clears target.confirmReplace once the write succeeds,
+    // so a failed save asks again.
     async confirmReplace(target: SaveTarget, handle: FileSystemFileHandle): Promise<boolean> {
         const file = await handle.getFile();
         const isOurs = file.size === 0
@@ -752,7 +758,6 @@ class FileSystemSaver implements TWSaver {
                 "If you cancel, nothing is saved and autosave pauses until you save manually. You can change " +
                 "the wiki file name in the saver settings.", problem);
         }
-        target.confirmReplace = false;
         return !isOurs;
     }
 
@@ -794,6 +799,7 @@ class FileSystemSaver implements TWSaver {
             logDebug("Writing wiki file...");
             await writeFile(handle, text);
             logDebug("Wrote wiki file successfully");
+            target.confirmReplace = false;
         });
 
         // Only remember the new hash once the file actually contains this text.
@@ -1000,7 +1006,9 @@ const canSave = (handler: SaverHandler) => {
     try {
         setupLogging(handler.wiki);
         registerHandleCleanup(handler.wiki);
-        return isEnabled(handler.wiki) && (!!window.showSaveFilePicker) && window.isSecureContext;
+        // Don't check isEnabled here: core only calls canSave at startup, so the saver couldn't be enabled
+        // later without a reload. save() returns false while it is disabled, so other savers are used.
+        return (!!window.showSaveFilePicker) && window.isSecureContext;
     } catch(err) {
         logDebug(err);
         return false;
@@ -1016,12 +1024,12 @@ const create = (wiki: TWWiki) => {
 
     // Wait one event cycle before trying to show the welcome page.
     window.setTimeout(() => {
-        if (wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(SHOW_WELCOME_MODAL_FIELD) === YES) {
+        if (isEnabled(wiki) && wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(SHOW_WELCOME_MODAL_FIELD) === YES) {
             logDebug("Showing welcome modal.");
             const modal = (window as any).$tw.modal as TWModalManager;
             modal.display(WELCOME_PAGE);
         } else {
-            logDebug("Not showing welcome modal since it is not enabled.");
+            logDebug("Not showing welcome modal since it or the saver is not enabled.");
         }
     }, 0);
 
