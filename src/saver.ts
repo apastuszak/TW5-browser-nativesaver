@@ -59,7 +59,14 @@ interface TWModalManager {
 interface TWWiki {
     getTiddler(name: string): Tiddler|undefined;
     addTiddler(tiddler: any): void;
+    addEventListener(type: "change", listener: (changes: {[title: string]: unknown}) => void): void;
     modal: TWModalManager;
+}
+
+// Internals of TiddlyWiki's saver handler ($tw.saverHandler) which track unsaved changes.
+interface TWSaverHandlerInternals {
+    numChanges: number;
+    updateDirtyStatus(): void;
 }
 
 interface SaverHandler {
@@ -184,7 +191,10 @@ const getTransactionCommitPromise = (transaction: IDBTransaction) => {
 const DB_VERSION = 1;
 const DB_NAME = `FileHandles-${UNIQUE_PLUGIN_ID}`;
 const DB_HANDLE_OBJECT_STORE_NAME = "FileHandles";
-const CURRENT_FILE_HANDLE_NAME = "CURRENT_FILE_HANDLE";
+const HANDLE_KEY_PREFIX = "WIKI_FILE_HANDLE:";
+// Keys from before 0.8.0, which hashed the URL differently and so can't be looked up any more.
+const LEGACY_HANDLE_KEY_PREFIX = "CURRENT_FILE_HANDLE";
+const SAVE_LOCK_NAME = `${PLUGIN_NAME}/save`;
 const IDB_READWRITE = "readwrite";
 const IDB_READONLY = "readonly";
 const IDB_RELAXED = "relaxed";
@@ -202,6 +212,10 @@ const tryCreateHandleStore = async (wiki: TWWiki) => {
     }
 
     logDebug("Browser supports IndexedDB so will attempt to create/retrieve a DB for storing a file handle.");
+    return openHandleStore();
+};
+
+const openHandleStore = async () => {
     const dbOpenRequest = window.indexedDB.open(DB_NAME, DB_VERSION);
 
     dbOpenRequest.onupgradeneeded = event => {
@@ -224,10 +238,25 @@ const tryCreateHandleStore = async (wiki: TWWiki) => {
             logDebug("File handle DB is being deleted or upgraded, closing connection.");
             db.close();
         };
+        deleteLegacyHandles(db);
         return db;
     } catch (err) {
         logDebug("Could not open database for storing file handles: %o", err);
         throw err;
+    }
+};
+
+// Remove handles stored by old versions, since nothing can use them but other pages on the same origin.
+const deleteLegacyHandles = (db: IDBDatabase) => {
+    try {
+        const transaction = db.transaction([DB_HANDLE_OBJECT_STORE_NAME], IDB_READWRITE);
+        getTransactionCommitPromise(transaction).catch(err => {
+            logDebug("Could not delete legacy file handles: %o", err);
+        });
+        transaction.objectStore(DB_HANDLE_OBJECT_STORE_NAME)
+            .delete(IDBKeyRange.bound(LEGACY_HANDLE_KEY_PREFIX, LEGACY_HANDLE_KEY_PREFIX + "\uffff"));
+    } catch (err) {
+        logDebug("Could not delete legacy file handles: %o", err);
     }
 };
 
@@ -276,7 +305,7 @@ const getIndexedDBKey = async () => {
     // Ignore the fragment since TiddlyWiki changes it when navigating with permalinks.
     const url = new URL(window.location.href);
     url.hash = "";
-    return CURRENT_FILE_HANDLE_NAME + (await hashToString(url.href));
+    return HANDLE_KEY_PREFIX + (await hashToString(url.href));
 }
 
 interface IndexedDBCacheable<T> {
@@ -293,6 +322,7 @@ interface CachedHandle<T> {
 async function getCachedHandle<T extends FileSystemHandle>(wiki: TWWiki, cacheable: IndexedDBCacheable<T>): Promise<CachedHandle<T>> {
     let db: IDBDatabase;
 
+    await pendingHandleRemoval;
     const storageKey = await getIndexedDBKey();
     logDebug("Computed storage key to be: [%s]", storageKey);
 
@@ -378,13 +408,63 @@ const getDirectoryHandle = async (wiki: TWWiki, startHandle?: FileSystemHandle) 
     });
 }
 
-const deleteHandleStore = () => {
+// Removes only this wiki's handle, since every wiki on file:// shares the database. This doesn't revoke
+// permission the browser already granted to open pages.
+const removeCachedHandle = async () => {
+    if (!window.indexedDB) {
+        return;
+    }
+    // Don't create the database just to remove something from it. databases() is missing from the
+    // TypeScript 4.2 DOM types.
+    const idbFactory = window.indexedDB as IDBFactory & { databases?(): Promise<{ name?: string }[]> };
+    if (idbFactory.databases) {
+        const databases = await idbFactory.databases();
+        if (!databases.some(info => info.name === DB_NAME)) {
+            return;
+        }
+    }
+
+    const storageKey = await getIndexedDBKey();
+    const db = await openHandleStore();
     try {
-        window.indexedDB.deleteDatabase(DB_NAME);
-    } catch(err) {
-        logDebug("Failed to delete file save location: %o", err);
+        const transaction = db.transaction([DB_HANDLE_OBJECT_STORE_NAME], IDB_READWRITE);
+        const commitPromise = getTransactionCommitPromise(transaction);
+        transaction.objectStore(DB_HANDLE_OBJECT_STORE_NAME).delete(storageKey);
+        await commitPromise;
+        logDebug("Removed cached file handle for this wiki.");
+    } finally {
+        db.close();
     }
 };
+
+// Handle lookups wait for this so that a save right after a reset can't read the old handle.
+let pendingHandleRemoval: Promise<void> = Promise.resolve();
+
+const removeCachedHandleInBackground = () => {
+    pendingHandleRemoval = pendingHandleRemoval.then(removeCachedHandle).catch(err => {
+        logDebug("Failed to remove cached file handle: %o", err);
+    });
+};
+
+// Other tabs have their own FileSystemSaver, so they need a lock shared between tabs to avoid both
+// passing the consistency check before either one writes.
+function withSaveLock<T>(callback: () => Promise<T>): Promise<T> {
+    const locks = (navigator as any).locks;
+    if (!locks) {
+        logDebug("Web Locks API not available, saving without a lock.");
+        return callback();
+    }
+    return locks.request(SAVE_LOCK_NAME, callback);
+}
+
+function getCoreSaverHandler(): TWSaverHandlerInternals | undefined {
+    const tw = (window as any).$tw;
+    const handler = tw && tw.saverHandler;
+    if (handler && typeof handler.numChanges === "number" && typeof handler.updateDirtyStatus === "function") {
+        return handler;
+    }
+    return undefined;
+}
 
 // Returns a string hash in hex for easy comparison and printing.
 async function hashToString(data: string | ArrayBuffer): Promise<string> {
@@ -481,6 +561,9 @@ class FileSystemSaver implements TWSaver {
     private prevWikiFile?: Promise<WikiFile>;
     // TiddlyWiki doesn't wait for one save to finish before starting the next, so saves are chained.
     private saveQueue: Promise<void> = Promise.resolve();
+    // How many changes our save callbacks have marked as saved. Added to TiddlyWiki's count of unsaved
+    // changes, this gives a total which never goes down.
+    private changesMarkedSaved = 0;
 
     constructor(private wiki: TWWiki) {
         setupLogging(wiki);
@@ -571,15 +654,17 @@ class FileSystemSaver implements TWSaver {
         const { handle } = await wikiFile;
         const textHashProm = hashToString(text);
 
-        if (this.shouldCheckConsistency()) {
-            await this.checkConsistency(wikiFile);
-        } else {
-            logDebug("Skipping consistency check");
-        }
+        await withSaveLock(async () => {
+            if (this.shouldCheckConsistency()) {
+                await this.checkConsistency(wikiFile);
+            } else {
+                logDebug("Skipping consistency check");
+            }
 
-        logDebug("Writing wiki file...");
-        await writeFile(handle, text);
-        logDebug("Wrote wiki file successfully");
+            logDebug("Writing wiki file...");
+            await writeFile(handle, text);
+            logDebug("Wrote wiki file successfully");
+        });
 
         // Only remember the new hash once the file actually contains this text.
         this.prevPageHash = await textHashProm;
@@ -645,13 +730,14 @@ class FileSystemSaver implements TWSaver {
                 return false;
         }
 
+        const changesIncluded = this.getTotalChanges();
         const savePromise = this.saveQueue.then(doSave);
         // Keep the queue going even if this save fails.
         this.saveQueue = savePromise.catch(() => {});
 
         savePromise.then(() => {
             logDebug("Successfully saved to file system");
-            callback(null);
+            this.markSaved(changesIncluded, callback);
         }, err => {
             logDebug("Encountered error while saving: %o", err);
             callback(`Encountered error while saving to file system: [${err}]`);
@@ -660,9 +746,35 @@ class FileSystemSaver implements TWSaver {
         return true;
     }
 
+    getTotalChanges(): number | undefined {
+        const handler = getCoreSaverHandler();
+        return handler ? handler.numChanges + this.changesMarkedSaved : undefined;
+    }
+
+    // TiddlyWiki's callback marks every change as saved, including ones made after this save's text was
+    // rendered (which may be waiting for a later save that could still fail), so mark those unsaved again.
+    markSaved(changesIncluded: number | undefined, callback: TWSaverCB) {
+        const handler = getCoreSaverHandler();
+        const totalChanges = this.getTotalChanges();
+        if (!handler || changesIncluded === undefined || totalChanges === undefined) {
+            callback(null);
+            return;
+        }
+
+        const unsavedChanges = Math.max(0, totalChanges - changesIncluded);
+        const changesBefore = handler.numChanges;
+        callback(null);
+        if (unsavedChanges > 0 && handler.numChanges < unsavedChanges) {
+            logDebug("%o changes were made after this save started, keeping them unsaved", unsavedChanges);
+            handler.numChanges = unsavedChanges;
+            handler.updateDirtyStatus();
+        }
+        this.changesMarkedSaved += changesBefore - handler.numChanges;
+    }
+
     reset() {
         logDebug("Reseting file saver...");
-        deleteHandleStore();
+        removeCachedHandleInBackground();
         setupLogging(this.wiki);
         this.target = undefined;
         logDebug("Reset file save location.");
@@ -687,6 +799,16 @@ const create = (wiki: TWWiki) => {
     const result = new FileSystemSaver(wiki);
     currentSaver = result;
 
+    // Don't leave a handle readable by other pages once storing it is disallowed.
+    if (!canUseIndexedDB(wiki)) {
+        removeCachedHandleInBackground();
+    }
+    wiki.addEventListener("change", changes => {
+        if (changes[PLUGIN_SETTINGS_DATA] && !canUseIndexedDB(wiki)) {
+            removeCachedHandleInBackground();
+        }
+    });
+
     // Wait one event cycle before trying to show the welcome page.
     window.setTimeout(() => {
         if (wiki.getTiddler(PLUGIN_SETTINGS_DATA)!.getFieldString(SHOW_WELCOME_MODAL_FIELD) === YES) {
@@ -706,7 +828,7 @@ const reset = () => {
     if (currentSaver) {
         currentSaver.reset();
     } else {
-        deleteHandleStore();
+        removeCachedHandleInBackground();
     }
 };
 

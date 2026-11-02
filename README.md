@@ -21,6 +21,12 @@ that this requires you to explicitly download the html page and then
 open it from your file system. Merely going to a webpage served via http(s)
 is not enough to exploit this vulnerability.
 
+Turning that setting off, or clicking "Reset file save location", removes
+this wiki's saved location from IndexedDB. It does not take back file access
+the browser has already granted: open pages keep it until they are closed,
+and if you chose "Allow on every visit" you need to remove it in the
+browser's site settings.
+
 It is recommended to backup the location where you store your wiki regularly.
 However, the single file with versioned backup saver style saves each version
 of your wiki under /{selected folder}/backups/{wiki filename}/{version hash}.html.
