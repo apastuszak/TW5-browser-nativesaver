@@ -47,7 +47,7 @@ TiddlyWiki 5 plugin (`$:/plugins/slaymaker1907/browser-nativesaver`) that saves 
 
 ## Updating example-wiki.html
 
-`npm run build` does not update `example-wiki.html`. When releasing, replace only the `$:/plugins/slaymaker1907/browser-nativesaver` tiddler in its `tiddlywiki-tiddler-store` JSON with the one from the freshly built `tw5.html` (escape `<` as `<`, as TiddlyWiki does). Don't re-render the whole file with the subtree's TiddlyWiki, which is an unreleased prerelease version.
+`npm run build` does not update `example-wiki.html`. When releasing, replace only the `$:/plugins/slaymaker1907/browser-nativesaver` tiddler in its `tiddlywiki-tiddler-store` JSON with the one from the freshly built `tw5.html` (escape `<` as `\u003C`, as TiddlyWiki does). Don't re-render the whole file with the subtree's TiddlyWiki, which is an unreleased prerelease version.
 
 ## Git
 
